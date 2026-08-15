@@ -1,30 +1,40 @@
 # mistralrs_proxy
 
 A small HTTP/1.1 reverse proxy for an OpenAI-compatible API. It authenticates
-clients against a compile-time allowlist and writes correlated request/response
-events as JSON Lines without doing serialization or file I/O on Tokio's request
-workers.
+clients against an allowlist loaded once at startup and writes correlated
+request/response events as JSON Lines without doing serialization or file I/O
+on Tokio's request workers.
 
 ## Configure and run
 
-Edit `ALLOWED_API_KEYS` in `src/auth.rs`, then rebuild. Clients authenticate in
-the same form used by the OpenAI SDK:
+Create a UTF-8 key file containing one printable-ASCII API key per line. Empty
+lines and lines beginning with `#` are ignored; duplicate keys and whitespace
+around a key are rejected. For example:
+
+```text
+# Local development
+foobar
+```
+
+Protect the file with appropriate permissions (for example, `chmod 600
+api_keys.txt`). It is read exactly once during startup. Editing, replacing, or
+deleting it has no effect on a running process; restart the proxy to load a new
+set of keys.
+
+Clients authenticate in the same form used by the OpenAI SDK:
 
 ```http
 Authorization: Bearer foobar
 ```
 
 ```console
-cargo run --release -- \
-  --listen-addr 127.0.0.1:3000 \
-  --upstream-url http://127.0.0.1:1234 \
-  --log-file proxy.jsonl
+cargo run --release -- --api-keys-file api_keys.txt --listen-addr 0.0.0.0:3000 --upstream-url http://127.0.0.1:1234 --log-file proxy.jsonl
 ```
 
-`LISTEN_ADDR`, `UPSTREAM_URL`, `CONNECT_TIMEOUT_MS`, and `LOG_FILE` are
-equivalent environment variables. `--log-file -` writes JSONL to stdout;
-startup and logger diagnostics go to stderr. Run `cargo run -- --help` for the
-complete CLI.
+`API_KEYS_FILE`, `LISTEN_ADDR`, `UPSTREAM_URL`, `CONNECT_TIMEOUT_MS`, and
+`LOG_FILE` are equivalent environment variables. `--log-file -` writes JSONL to
+stdout; startup and logger diagnostics go to stderr. Run `cargo run -- --help`
+for the complete CLI.
 
 The current Hyper connector intentionally supports plain HTTP upstreams only,
 which is appropriate for a local mistral.rs server. The proxy sends the original
@@ -75,6 +85,6 @@ not trusted because the proxy has no trusted-proxy configuration.
 
 Logs intentionally contain plaintext API keys, headers, prompts, and responses.
 Log files are restricted to mode `0600` on Unix. Apply suitable access,
-retention, and rotation controls. Compile-time keys are also extractable from the
-binary and require a rebuild to rotate. The default local `proxy.jsonl` path is
-ignored by Git.
+retention, and rotation controls. The allowlist file should receive the same
+care; the standalone proxy retains only key digests after loading it. The default
+local `api_keys.txt` and `proxy.jsonl` paths are ignored by Git.

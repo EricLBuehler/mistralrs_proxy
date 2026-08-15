@@ -12,7 +12,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use mistralrs_proxy::{logging, proxy};
+use mistralrs_proxy::{auth::ApiKeyAllowlist, logging, proxy};
 use serde_json::Value;
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
@@ -56,6 +56,10 @@ fn http_client() -> Client<HttpConnector, Body> {
     Client::builder(TokioExecutor::new()).build(connector)
 }
 
+fn api_keys() -> ApiKeyAllowlist {
+    ApiKeyAllowlist::from_keys(["foobar"]).unwrap()
+}
+
 async fn stop_server(shutdown: tokio::sync::oneshot::Sender<()>, task: JoinHandle<()>) {
     let _ = shutdown.send(());
     tokio::time::timeout(Duration::from_secs(5), task)
@@ -88,6 +92,7 @@ async fn proxies_authenticates_and_correlates_jsonl_records() {
         http_client(),
         format!("http://{upstream_addr}/internal").parse().unwrap(),
         logger,
+        api_keys(),
     ));
     let app = proxy::router(state);
     let (proxy_shutdown_tx, proxy_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -247,6 +252,7 @@ async fn upstream_connection_failure_is_a_logged_bad_gateway() {
         http_client(),
         format!("http://{unused_addr}").parse().unwrap(),
         logger,
+        api_keys(),
     ));
     let app = proxy::router(state);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();

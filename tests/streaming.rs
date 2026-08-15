@@ -23,7 +23,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use mistralrs_proxy::{logging, proxy};
+use mistralrs_proxy::{auth::ApiKeyAllowlist, logging, proxy};
 use serde_json::Value;
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
@@ -157,6 +157,7 @@ async fn proxy_forwards_response_headers_and_frames_without_buffering() {
         http_client(),
         format!("http://{upstream_addr}").parse().unwrap(),
         logger,
+        ApiKeyAllowlist::from_keys(["foobar"]).unwrap(),
     ));
     let proxy_app = proxy::router(state);
     let (proxy_shutdown_tx, proxy_shutdown_rx) = oneshot::channel();

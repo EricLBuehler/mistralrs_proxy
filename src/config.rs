@@ -10,6 +10,10 @@ use clap::Parser;
     about = "A low-latency, JSONL-logging proxy for an OpenAI-compatible HTTP API"
 )]
 pub struct Args {
+    /// File containing one accepted API key per line.
+    #[arg(long, env = "API_KEYS_FILE", value_name = "PATH")]
+    pub api_keys_file: PathBuf,
+
     /// Address on which the proxy accepts connections.
     #[arg(
         short = 'l',
@@ -67,12 +71,15 @@ fn parse_upstream_url(value: &str) -> Result<Uri, String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     #[test]
     fn defaults_are_valid() {
-        let args = Args::try_parse_from(["proxy"]).unwrap();
+        let args = Args::try_parse_from(["proxy", "--api-keys-file", "api_keys.txt"]).unwrap();
 
+        assert_eq!(args.api_keys_file, PathBuf::from("api_keys.txt"));
         assert_eq!(args.listen_addr, "127.0.0.1:3000".parse().unwrap());
         assert_eq!(args.upstream_url, "http://127.0.0.1:1234");
         assert_eq!(args.connect_timeout_ms, 5_000);
@@ -81,24 +88,49 @@ mod tests {
 
     #[test]
     fn accepts_an_upstream_path_prefix() {
-        let args =
-            Args::try_parse_from(["proxy", "--upstream-url", "http://127.0.0.1:1234/internal"])
-                .unwrap();
+        let args = Args::try_parse_from([
+            "proxy",
+            "--api-keys-file",
+            "api_keys.txt",
+            "--upstream-url",
+            "http://127.0.0.1:1234/internal",
+        ])
+        .unwrap();
 
         assert_eq!(args.upstream_url.path(), "/internal");
     }
 
     #[test]
     fn rejects_unsupported_or_relative_upstreams() {
-        assert!(Args::try_parse_from(["proxy", "--upstream-url", "https://example.com"]).is_err());
-        assert!(Args::try_parse_from(["proxy", "--upstream-url", "/relative"]).is_err());
+        let prefix = ["proxy", "--api-keys-file", "api_keys.txt", "--upstream-url"];
+        assert!(Args::try_parse_from(prefix.into_iter().chain(["https://example.com"])).is_err());
+        assert!(Args::try_parse_from(prefix.into_iter().chain(["/relative"])).is_err());
         assert!(
-            Args::try_parse_from(["proxy", "--upstream-url", "http://example.com?q=1"]).is_err()
+            Args::try_parse_from(prefix.into_iter().chain(["http://example.com?q=1"])).is_err()
         );
         assert!(
-            Args::try_parse_from(["proxy", "--upstream-url", "http://user:pass@example.com"])
+            Args::try_parse_from(prefix.into_iter().chain(["http://user:pass@example.com"]))
                 .is_err()
         );
-        assert!(Args::try_parse_from(["proxy", "--connect-timeout-ms", "0"]).is_err());
+        assert!(
+            Args::try_parse_from([
+                "proxy",
+                "--api-keys-file",
+                "api_keys.txt",
+                "--connect-timeout-ms",
+                "0"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn api_key_file_is_required() {
+        let command = Args::command();
+        let argument = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "api_keys_file")
+            .unwrap();
+        assert!(argument.is_required_set());
     }
 }

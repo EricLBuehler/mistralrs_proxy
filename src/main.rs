@@ -6,11 +6,12 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use mistralrs_proxy::{config::Args, logging, proxy};
+use mistralrs_proxy::{auth::ApiKeyAllowlist, config::Args, logging, proxy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    let api_keys = ApiKeyAllowlist::from_file(&args.api_keys_file)?;
     let listener = tokio::net::TcpListener::bind(args.listen_addr).await?;
     let local_addr = listener.local_addr()?;
     let listener = listener.tap_io(|stream| {
@@ -28,6 +29,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client,
         args.upstream_url,
         logger,
+        api_keys,
     )));
 
     eprintln!("proxy listening on http://{local_addr}");

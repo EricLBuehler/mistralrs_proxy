@@ -19,7 +19,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthError, authenticate},
+    auth::{ApiKeyAllowlist, AuthError, authenticate},
     logging::LogSender,
 };
 
@@ -29,14 +29,21 @@ pub struct AppState {
     client: HttpClient,
     upstream: Uri,
     logger: LogSender,
+    api_keys: ApiKeyAllowlist,
 }
 
 impl AppState {
-    pub fn new(client: HttpClient, upstream: Uri, logger: LogSender) -> Self {
+    pub fn new(
+        client: HttpClient,
+        upstream: Uri,
+        logger: LogSender,
+        api_keys: ApiKeyAllowlist,
+    ) -> Self {
         Self {
             client,
             upstream,
             logger,
+            api_keys,
         }
     }
 }
@@ -62,7 +69,7 @@ async fn proxy(
             "The audit log writer is unavailable; the proxy is failing closed.",
         );
     }
-    let authentication = authenticate(&parts.headers);
+    let authentication = authenticate(&parts.headers, &state.api_keys);
     let authorized = authentication.result.is_ok();
     state.logger.request_started(
         request_id,
