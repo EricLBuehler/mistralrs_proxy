@@ -9,7 +9,7 @@ use hyper_util::{
 use mistralrs_proxy::{
     auth::KeyStore,
     config::{Cli, Command, KeyCommand, ServeArgs},
-    logging, manage, proxy,
+    logging, logs, manage, proxy,
 };
 
 fn main() -> ExitCode {
@@ -19,6 +19,7 @@ fn main() -> ExitCode {
             manage::create(&keys.keys_file, &name, admin)
         }
         Command::Key(KeyCommand::Manage { keys }) => manage::manage(&keys.keys_file),
+        Command::Logs(args) => logs::run(&args.log_file, args.summary),
     };
 
     match result {

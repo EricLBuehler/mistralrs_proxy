@@ -41,15 +41,17 @@ pub fn create(path: &Path, name: &str, admin: bool) -> Result<(), Box<dyn Error>
     file.keys.push(record);
     file.save(path)?;
 
-    println!("{key}");
-    println!();
-    println!("  name        {name}");
-    println!("  identifier  {identifier}");
-    println!("  admin       {admin}");
-    println!("  stored in   {}", path.display());
-    println!();
-    println!("This is the only time the key is shown; only its digest is stored.");
-    println!("Key created. Restart mistralrs_proxy to apply changes.");
+    crate::logs::write_lines(&[
+        key,
+        String::new(),
+        format!("  name        {name}"),
+        format!("  identifier  {identifier}"),
+        format!("  admin       {admin}"),
+        format!("  stored in   {}", path.display()),
+        String::new(),
+        "This is the only time the key is shown; only its digest is stored.".to_owned(),
+        "Key created. Restart mistralrs_proxy to apply changes.".to_owned(),
+    ])?;
 
     Ok(())
 }

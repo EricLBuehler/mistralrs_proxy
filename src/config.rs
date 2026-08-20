@@ -23,6 +23,24 @@ pub enum Command {
     /// Create and administer API keys.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Summarise and explore the audit log of a running or finished proxy.
+    Logs(LogsArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct LogsArgs {
+    /// JSONL audit log to read.
+    #[arg(
+        long,
+        env = "LOG_FILE",
+        default_value = "proxy.jsonl",
+        value_name = "PATH"
+    )]
+    pub log_file: PathBuf,
+
+    /// Print the summary and exit instead of opening the explorer.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -198,6 +216,27 @@ mod tests {
                 assert_eq!(keys.keys_file, PathBuf::from("/tmp/other.json"));
             }
             other => panic!("expected key manage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logs_defaults_to_the_same_file_serve_writes() {
+        let cli = Cli::try_parse_from(["mistralrs_proxy", "logs"]).unwrap();
+
+        match cli.command {
+            Command::Logs(args) => {
+                assert_eq!(args.log_file, serve(&[]).unwrap().log_file);
+                assert!(!args.summary);
+            }
+            other => panic!("expected logs, got {other:?}"),
+        }
+
+        match Cli::try_parse_from(["mistralrs_proxy", "logs", "--summary"])
+            .unwrap()
+            .command
+        {
+            Command::Logs(args) => assert!(args.summary),
+            other => panic!("expected logs, got {other:?}"),
         }
     }
 
