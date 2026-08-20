@@ -7,43 +7,40 @@ use axum::{
     http::{
         self, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
         header::{
-            CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
-            TRANSFER_ENCODING, UPGRADE, WWW_AUTHENTICATE,
+            ACCEPT_ENCODING, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
+            TRAILER, TRANSFER_ENCODING, UPGRADE, WWW_AUTHENTICATE,
         },
+        request,
     },
     response::{IntoResponse, Response},
 };
-use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    auth::{ApiKeyAllowlist, AuthError, authenticate},
-    logging::LogSender,
+    auth::{AuthError, KeyStore, authenticate},
+    logging::{LogSender, RequestInfo},
 };
 
 pub type HttpClient = Client<HttpConnector, Body>;
+
+const IDENTITY: HeaderValue = HeaderValue::from_static("identity");
 
 pub struct AppState {
     client: HttpClient,
     upstream: Uri,
     logger: LogSender,
-    api_keys: ApiKeyAllowlist,
+    keys: KeyStore,
 }
 
 impl AppState {
-    pub fn new(
-        client: HttpClient,
-        upstream: Uri,
-        logger: LogSender,
-        api_keys: ApiKeyAllowlist,
-    ) -> Self {
+    pub fn new(client: HttpClient, upstream: Uri, logger: LogSender, keys: KeyStore) -> Self {
         Self {
             client,
             upstream,
             logger,
-            api_keys,
+            keys,
         }
     }
 }
@@ -52,45 +49,46 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new().fallback(proxy).with_state(state)
 }
 
+/// Authenticate, forward, and log. Every response leaves through
+/// [`finish`], which is the only place a response body gets wrapped.
 async fn proxy(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    let request_id = Uuid::new_v4();
-    let (mut parts, body) = request.into_parts();
     if !state.logger.is_healthy() {
-        return json_error_response(
-            &state.logger,
-            request_id,
+        // Nothing can be logged, so answer without attempting to.
+        return json_error_body(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
             "logger_unavailable",
             "The audit log writer is unavailable; the proxy is failing closed.",
         );
     }
-    let authentication = authenticate(&parts.headers, &state.api_keys);
-    let authorized = authentication.result.is_ok();
-    state.logger.request_started(
-        request_id,
-        peer,
-        authentication.presented_key,
-        authorized,
-        &parts,
-    );
 
-    if let Err(error) = authentication.result {
-        state.logger.drain_request(request_id, body);
-        return authentication_error(&state.logger, request_id, error);
-    }
+    let request_id = Uuid::new_v4();
+    let (parts, body) = request.into_parts();
+    let authentication = authenticate(&parts.headers, &state.keys);
+    // Held for the rest of the handler: if the client disconnects while we wait
+    // on the upstream, this closes the record out instead of leaking it.
+    let mut guard = state
+        .logger
+        .request_started(request_id, RequestInfo::new(peer, &parts, &authentication));
 
+    let response = match authentication.result {
+        Ok(()) => forward(&state, parts, body).await,
+        Err(error) => authentication_error(error),
+    };
+
+    guard.disarm();
+    finish(&state.logger, request_id, response)
+}
+
+async fn forward(state: &AppState, mut parts: request::Parts, body: Body) -> Response {
     parts.uri = match upstream_uri(&state.upstream, &parts.uri) {
         Ok(uri) => uri,
         Err(error) => {
-            state.logger.drain_request(request_id, body);
-            return json_error_response(
-                &state.logger,
-                request_id,
+            return json_error_body(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "invalid_proxy_uri",
@@ -102,15 +100,14 @@ async fn proxy(
     parts.version = http::Version::HTTP_11;
     remove_hop_by_hop_headers(&mut parts.headers);
     set_upstream_host(&parts.uri, &mut parts.headers);
-    let body = state.logger.request_body(request_id, body);
-    let upstream_request = Request::from_parts(parts, body);
+    // Token accounting reads the `usage` object out of the response as it
+    // streams past, which only works on an uncompressed body.
+    parts.headers.insert(ACCEPT_ENCODING, IDENTITY);
 
-    let upstream_response = match state.client.request(upstream_request).await {
+    let upstream_response = match state.client.request(Request::from_parts(parts, body)).await {
         Ok(response) => response,
         Err(error) => {
-            return json_error_response(
-                &state.logger,
-                request_id,
+            return json_error_body(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 "upstream_connection_error",
@@ -119,38 +116,36 @@ async fn proxy(
         }
     };
 
-    relay_response(&state.logger, request_id, upstream_response)
+    let (mut parts, body) = upstream_response.into_parts();
+    parts.version = http::Version::HTTP_11;
+    remove_hop_by_hop_headers(&mut parts.headers);
+
+    Response::from_parts(parts, Body::new(body))
 }
 
-fn authentication_error(logger: &LogSender, request_id: Uuid, error: AuthError) -> Response {
+fn authentication_error(error: AuthError) -> Response {
+    let status = if error == AuthError::Disabled {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::UNAUTHORIZED
+    };
     let mut response = json_error_body(
-        StatusCode::UNAUTHORIZED,
+        status,
         "invalid_request_error",
-        "invalid_api_key",
+        error.code(),
         error.message(),
     );
     response
         .headers_mut()
         .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-    finish_local_response(logger, request_id, response)
-}
 
-fn json_error_response(
-    logger: &LogSender,
-    request_id: Uuid,
-    status: StatusCode,
-    error_type: &'static str,
-    code: &'static str,
-    message: &str,
-) -> Response {
-    let response = json_error_body(status, error_type, code, message);
-    finish_local_response(logger, request_id, response)
+    response
 }
 
 fn json_error_body(
     status: StatusCode,
     error_type: &'static str,
-    code: &'static str,
+    code: &str,
     message: &str,
 ) -> Response {
     (
@@ -167,28 +162,14 @@ fn json_error_body(
         .into_response()
 }
 
-fn finish_local_response(logger: &LogSender, request_id: Uuid, mut response: Response) -> Response {
+/// Stamp the request id and hand the body to the logger for byte counting and
+/// token sniffing.
+fn finish(logger: &LogSender, request_id: Uuid, mut response: Response) -> Response {
     insert_request_id(&mut response, request_id);
-    log_response(logger, request_id, response)
-}
-
-fn relay_response(
-    logger: &LogSender,
-    request_id: Uuid,
-    response: http::Response<Incoming>,
-) -> Response {
-    let (mut parts, body) = response.into_parts();
-    parts.version = http::Version::HTTP_11;
-    remove_hop_by_hop_headers(&mut parts.headers);
-    let mut response = Response::from_parts(parts, Body::new(body));
-    insert_request_id(&mut response, request_id);
-    log_response(logger, request_id, response)
-}
-
-fn log_response(logger: &LogSender, request_id: Uuid, response: Response) -> Response {
     let (parts, body) = response.into_parts();
     logger.response_started(request_id, &parts);
     let body = logger.response_body(request_id, body);
+
     Response::from_parts(parts, body)
 }
 

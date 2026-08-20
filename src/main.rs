@@ -1,4 +1,4 @@
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{error::Error, path::Path, process::ExitCode, sync::Arc, time::Duration};
 
 use axum::serve::ListenerExt;
 use clap::Parser;
@@ -6,12 +6,52 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use mistralrs_proxy::{auth::ApiKeyAllowlist, config::Args, logging, proxy};
+use mistralrs_proxy::{
+    auth::KeyStore,
+    config::{Cli, Command, KeyCommand, ServeArgs},
+    logging, manage, proxy,
+};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    let api_keys = ApiKeyAllowlist::from_file(&args.api_keys_file)?;
+fn main() -> ExitCode {
+    let result = match Cli::parse().command {
+        Command::Serve(args) => serve(args),
+        Command::Key(KeyCommand::Create { name, admin, keys }) => {
+            manage::create(&keys.keys_file, &name, admin)
+        }
+        Command::Key(KeyCommand::Manage { keys }) => manage::manage(&keys.keys_file),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("mistralrs_proxy: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
+    let keys = load_keys(&args.keys.keys_file)?;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args, keys))
+}
+
+fn load_keys(path: &Path) -> Result<KeyStore, Box<dyn Error>> {
+    match KeyStore::from_file(path) {
+        Ok(keys) => Ok(keys),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "no key file at {}. Run `mistralrs_proxy key create <name>` to create one.",
+            path.display()
+        )
+        .into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn run(args: ServeArgs, keys: KeyStore) -> Result<(), Box<dyn Error>> {
     let listener = tokio::net::TcpListener::bind(args.listen_addr).await?;
     let local_addr = listener.local_addr()?;
     let listener = listener.tap_io(|stream| {
@@ -20,19 +60,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let (logger, log_worker) = logging::start(&args.log_file)?;
+    let (logger, log_worker) = logging::start(&args.log_file, !args.quiet)?;
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
     connector.set_connect_timeout(Some(Duration::from_millis(args.connect_timeout_ms)));
     let client = Client::builder(TokioExecutor::new()).build(connector);
+    let key_count = keys.len();
     let app = proxy::router(Arc::new(proxy::AppState::new(
         client,
-        args.upstream_url,
+        args.upstream_url.clone(),
         logger,
-        api_keys,
+        keys,
     )));
 
-    eprintln!("proxy listening on http://{local_addr}");
+    eprintln!(
+        "proxy listening on http://{local_addr}, forwarding to {}, {key_count} key{} loaded",
+        args.upstream_url,
+        if key_count == 1 { "" } else { "s" },
+    );
     let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -40,8 +85,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .with_graceful_shutdown(shutdown_signal())
     .await;
 
-    // Dropping the service closes the event channel. The worker drains everything
-    // already queued before it exits and flushes the JSONL writer.
+    // Dropping the service closes the event channel. The worker drains
+    // everything already queued before it exits and flushes the JSONL writer.
     let log_result = log_worker.join();
     serve_result?;
     log_result?;

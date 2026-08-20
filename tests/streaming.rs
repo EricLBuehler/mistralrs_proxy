@@ -1,8 +1,7 @@
+mod support;
+
 use std::{
     convert::Infallible,
-    fs,
-    net::SocketAddr,
-    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -19,20 +18,14 @@ use axum::{
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
-};
-use mistralrs_proxy::{auth::ApiKeyAllowlist, logging, proxy};
-use serde_json::Value;
-use tokio::{
-    sync::{Mutex, mpsc, oneshot},
-    task::JoinHandle,
-};
-use uuid::Uuid;
+use tokio::sync::{Mutex, mpsc};
 
-const FIRST_CHUNK: &[u8] = b"data: first\n\n";
-const SECOND_CHUNK: &[u8] = b"data: second\n\n";
+use support::{Proxy, Upstream, http_client, one_key, record_for};
+
+const FIRST_CHUNK: &[u8] =
+    b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n";
+const SECOND_CHUNK: &[u8] =
+    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":3,\"total_tokens\":22}}\n\n";
 
 struct ChannelBody {
     rx: mpsc::Receiver<Bytes>,
@@ -81,104 +74,24 @@ async fn streaming_upstream(State(state): State<UpstreamState>) -> Response {
         .unwrap()
 }
 
-fn http_client() -> Client<HttpConnector, Body> {
-    let mut connector = HttpConnector::new();
-    connector.set_nodelay(true);
-    Client::builder(TokioExecutor::new()).build(connector)
-}
-
-async fn stop_server(shutdown: oneshot::Sender<()>, task: JoinHandle<()>) {
-    let _ = shutdown.send(());
-    tokio::time::timeout(Duration::from_secs(5), task)
-        .await
-        .expect("server did not shut down")
-        .expect("server task panicked");
-}
-
-struct TempLogPath(PathBuf);
-
-impl TempLogPath {
-    fn new() -> Self {
-        Self(std::env::temp_dir().join(format!(
-            "mistralrs-proxy-streaming-{}.jsonl",
-            Uuid::new_v4()
-        )))
-    }
-
-    fn as_path(&self) -> &Path {
-        &self.0
-    }
-
-    fn records(&self) -> Vec<Value> {
-        fs::read_to_string(&self.0)
-            .expect("read streaming test log")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("parse streaming JSON log record"))
-            .collect()
-    }
-}
-
-impl Drop for TempLogPath {
-    fn drop(&mut self) {
-        match fs::remove_file(&self.0) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => panic!("remove test log {}: {error}", self.0.display()),
-        }
-    }
-}
-
 #[tokio::test]
-async fn proxy_forwards_response_headers_and_frames_without_buffering() {
+async fn frames_are_forwarded_without_buffering_and_usage_lands_in_one_record() {
     let (upstream_body_tx, upstream_body_rx) = mpsc::channel(2);
-    let upstream_state = UpstreamState {
-        body_rx: Arc::new(Mutex::new(Some(upstream_body_rx))),
-    };
-    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = upstream_listener.local_addr().unwrap();
-    let upstream_app = Router::new()
-        .fallback(streaming_upstream)
-        .with_state(upstream_state);
-    let (upstream_shutdown_tx, upstream_shutdown_rx) = oneshot::channel();
-    let upstream_task = tokio::spawn(async move {
-        axum::serve(upstream_listener, upstream_app)
-            .with_graceful_shutdown(async move {
-                let _ = upstream_shutdown_rx.await;
-            })
-            .await
-            .unwrap();
-    });
-
-    let log_path = TempLogPath::new();
-    let (logger, log_worker) = logging::start(log_path.as_path()).unwrap();
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy_listener.local_addr().unwrap();
-    let state = Arc::new(proxy::AppState::new(
-        http_client(),
-        format!("http://{upstream_addr}").parse().unwrap(),
-        logger,
-        ApiKeyAllowlist::from_keys(["foobar"]).unwrap(),
-    ));
-    let proxy_app = proxy::router(state);
-    let (proxy_shutdown_tx, proxy_shutdown_rx) = oneshot::channel();
-    let proxy_task = tokio::spawn(async move {
-        axum::serve(
-            proxy_listener,
-            proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = proxy_shutdown_rx.await;
-        })
-        .await
-        .unwrap();
-    });
+    let upstream = Upstream::start(Router::new().fallback(streaming_upstream).with_state(
+        UpstreamState {
+            body_rx: Arc::new(Mutex::new(Some(upstream_body_rx))),
+        },
+    ))
+    .await;
+    let (keys, key) = one_key();
+    let proxy = Proxy::start(upstream.uri(""), keys).await;
 
     let client = http_client();
     let request = Request::builder()
         .method("POST")
-        .uri(format!("http://{proxy_addr}/v1/responses"))
+        .uri(proxy.url("/v1/responses"))
         .header(header::HOST, "api.client.example")
-        .header(header::AUTHORIZATION, "Bearer foobar")
+        .header(header::AUTHORIZATION, format!("Bearer {}", key.secret))
         .body(Body::empty())
         .unwrap();
 
@@ -239,52 +152,67 @@ async fn proxy_forwards_response_headers_and_frames_without_buffering() {
 
     drop(response);
     drop(client);
-    stop_server(proxy_shutdown_tx, proxy_task).await;
-    log_worker.join().unwrap();
-    stop_server(upstream_shutdown_tx, upstream_task).await;
+    let records = proxy.stop().await;
+    upstream.stop().await;
 
-    let records = log_path.records();
-    let response_records: Vec<_> = records
-        .iter()
-        .filter(|record| record["request_id"] == request_id && record["event"] != "request")
-        .collect();
-    let response_events: Vec<_> = response_records
-        .iter()
-        .map(|record| record["event"].as_str().unwrap())
-        .collect();
+    // A stream that produced two frames still yields exactly one record.
+    let record = record_for(&records, &request_id);
+    assert_eq!(record["event"], "request");
+    assert_eq!(record["status"], 200);
     assert_eq!(
-        response_events,
-        [
-            "response_start",
-            "response_body",
-            "response_body",
-            "response_end"
-        ]
-    );
-
-    let body_records: Vec<_> = response_records
-        .iter()
-        .filter(|record| record["event"] == "response_body")
-        .collect();
-    assert_eq!(body_records[0]["sequence"], 0);
-    assert_eq!(body_records[0]["offset"], 0);
-    assert_eq!(
-        body_records[0]["body"].as_str().unwrap(),
-        std::str::from_utf8(FIRST_CHUNK).unwrap()
-    );
-    assert_eq!(body_records[1]["sequence"], 1);
-    assert_eq!(body_records[1]["offset"], FIRST_CHUNK.len() as u64);
-    assert_eq!(
-        body_records[1]["body"].as_str().unwrap(),
-        std::str::from_utf8(SECOND_CHUNK).unwrap()
-    );
-
-    let response_end = response_records.last().unwrap();
-    assert_eq!(response_end["event"], "response_end");
-    assert_eq!(
-        response_end["total_body_bytes"],
+        record["response_bytes"],
         (FIRST_CHUNK.len() + SECOND_CHUNK.len()) as u64
     );
-    assert_eq!(response_end["complete"], true);
-    assert_eq!(response_end["termination"], "complete");
+    assert_eq!(record["input_tokens"], 19);
+    assert_eq!(record["output_tokens"], 3);
+    assert_eq!(record["total_tokens"], 22);
+    assert_eq!(record["complete"], true);
+    assert_eq!(record["termination"], "complete");
+    assert!(record["time_to_first_byte_ms"].is_u64());
+}
+
+#[tokio::test]
+async fn a_client_that_abandons_a_stream_is_recorded_as_incomplete() {
+    let (upstream_body_tx, upstream_body_rx) = mpsc::channel(2);
+    let upstream = Upstream::start(Router::new().fallback(streaming_upstream).with_state(
+        UpstreamState {
+            body_rx: Arc::new(Mutex::new(Some(upstream_body_rx))),
+        },
+    ))
+    .await;
+    let (keys, key) = one_key();
+    let proxy = Proxy::start(upstream.uri(""), keys).await;
+
+    let client = http_client();
+    let request = Request::builder()
+        .method("POST")
+        .uri(proxy.url("/v1/responses"))
+        .header(header::AUTHORIZATION, format!("Bearer {}", key.secret))
+        .body(Body::empty())
+        .unwrap();
+    let mut response = client.request(request).await.unwrap();
+    let request_id = response.headers()["x-proxy-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    upstream_body_tx
+        .send(Bytes::from_static(FIRST_CHUNK))
+        .await
+        .unwrap();
+    response.body_mut().frame().await.unwrap().unwrap();
+
+    // Hang up mid-stream, before the chunk that would have carried usage.
+    drop(response);
+    drop(client);
+    drop(upstream_body_tx);
+
+    let records = proxy.stop().await;
+    upstream.stop().await;
+
+    let record = record_for(&records, &request_id);
+    assert_eq!(record["complete"], false);
+    assert_eq!(record["termination"], "body_dropped");
+    assert_eq!(record["input_tokens"], serde_json::Value::Null);
+    assert_eq!(record["response_bytes"], FIRST_CHUNK.len());
 }

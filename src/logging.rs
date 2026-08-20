@@ -1,5 +1,15 @@
+//! Per-request audit logging.
+//!
+//! Exactly one JSON Lines record is written per proxied request, when its
+//! response finishes. Records carry request metadata, the caller's key name,
+//! identifier, and digest, and the token counts sniffed out of the response —
+//! never a key, a prompt, or a completion.
+//!
+//! Serialization and file I/O happen on a dedicated OS thread so Tokio's
+//! request workers never touch the disk. The same thread prints the
+//! human-readable arrival and completion lines to stderr.
+
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fs::OpenOptions,
     io::{self, BufWriter, Write},
@@ -21,112 +31,147 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use axum::{
     body::Body,
-    http::{HeaderMap, Method, StatusCode, Uri, Version, header::HOST, request, response},
+    http::{
+        Method, StatusCode, Uri, Version,
+        header::{CONTENT_LENGTH, HOST, USER_AGENT},
+        request, response,
+    },
 };
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use pin_project_lite::pin_project;
 use serde::Serialize;
-use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
+
+use crate::{
+    auth::{Authentication, KeyIdentity},
+    usage::UsageSniffer,
+};
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Handle used by the request path to report events. Cloning is cheap.
 #[derive(Clone)]
 pub struct LogSender {
     tx: Sender<LogEvent>,
     healthy: Arc<AtomicBool>,
 }
 
+/// Join handle for the writer thread.
 pub struct LogWorker {
     thread: JoinHandle<io::Result<()>>,
 }
 
+/// How a request ended.
 #[derive(Debug)]
 pub enum BodyOutcome {
     Complete,
+    /// The response body was dropped before it finished.
     Aborted,
+    /// The handler was dropped before any response existed, which is what
+    /// happens when a client disconnects mid-request.
+    Abandoned,
     Error(String),
+}
+
+impl BodyOutcome {
+    fn describe(&self) -> (bool, &'static str, Option<&str>) {
+        match self {
+            Self::Complete => (true, "complete", None),
+            Self::Aborted => (false, "body_dropped", None),
+            Self::Abandoned => (false, "client_disconnected", None),
+            Self::Error(error) => (false, "body_error", Some(error.as_str())),
+        }
+    }
+}
+
+/// Everything worth recording about an inbound request. No body, no key.
+#[derive(Debug)]
+pub struct RequestInfo {
+    pub peer: SocketAddr,
+    pub method: Method,
+    pub uri: Uri,
+    pub version: Version,
+    pub host: Option<String>,
+    pub user_agent: Option<String>,
+    pub content_length: Option<u64>,
+    pub key_sha256: Option<String>,
+    pub identity: Option<Arc<KeyIdentity>>,
+    pub authorized: bool,
+    pub auth_error: Option<&'static str>,
+}
+
+impl RequestInfo {
+    /// Collect the loggable fields of a request and its authentication result.
+    pub fn new(peer: SocketAddr, parts: &request::Parts, auth: &Authentication) -> Self {
+        Self {
+            peer,
+            method: parts.method.clone(),
+            uri: parts.uri.clone(),
+            version: parts.version,
+            host: header_string(parts.headers.get(HOST))
+                .or_else(|| parts.uri.authority().map(ToString::to_string)),
+            user_agent: header_string(parts.headers.get(USER_AGENT)),
+            content_length: header_string(parts.headers.get(CONTENT_LENGTH))
+                .and_then(|value| value.parse().ok()),
+            key_sha256: auth.key_sha256.clone(),
+            identity: auth.identity.clone(),
+            authorized: auth.result.is_ok(),
+            auth_error: auth.result.err().map(|error| error.code()),
+        }
+    }
+
+    /// `name[identifier]` for a known key, or a stable stand-in when the key is
+    /// unknown or absent.
+    fn principal(&self) -> String {
+        match (&self.identity, &self.key_sha256) {
+            (Some(identity), _) => format!("{}[{}]", identity.name, identity.identifier),
+            (None, Some(digest)) => format!("unknown[{}]", &digest[..8.min(digest.len())]),
+            (None, None) => "anonymous".to_owned(),
+        }
+    }
+}
+
+fn header_string(value: Option<&axum::http::HeaderValue>) -> Option<String> {
+    value.map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
 }
 
 enum LogEvent {
     RequestStarted {
         id: Uuid,
-        timestamp_unix_ms: u64,
-        metadata: RequestMetadata,
-    },
-    RequestChunk {
-        id: Uuid,
-        bytes: Bytes,
-    },
-    RequestTrailers {
-        id: Uuid,
-        trailers: HeaderMap,
-    },
-    RequestFinished {
-        id: Uuid,
-        completed_at_unix_ms: u64,
-        outcome: BodyOutcome,
+        at_unix_ms: u64,
+        info: Box<RequestInfo>,
     },
     ResponseStarted {
         id: Uuid,
-        timestamp_unix_ms: u64,
-        metadata: ResponseMetadata,
+        at_unix_ms: u64,
+        status: StatusCode,
     },
     ResponseChunk {
         id: Uuid,
-        timestamp_unix_ms: u64,
-        sequence: u64,
-        offset: u64,
         bytes: Bytes,
-    },
-    ResponseTrailers {
-        id: Uuid,
-        timestamp_unix_ms: u64,
-        sequence: u64,
-        trailers: HeaderMap,
     },
     ResponseFinished {
         id: Uuid,
-        timestamp_unix_ms: u64,
-        total_body_bytes: u64,
+        at_unix_ms: u64,
         outcome: BodyOutcome,
     },
 }
 
-struct RequestMetadata {
-    peer: SocketAddr,
-    api_key: Option<String>,
-    authorized: bool,
-    method: Method,
-    uri: Uri,
-    version: Version,
-    headers: HeaderMap,
+struct Pending {
+    started_at_unix_ms: u64,
+    info: Box<RequestInfo>,
+    status: Option<StatusCode>,
+    first_byte_at_unix_ms: Option<u64>,
+    response_bytes: u64,
+    sniffer: UsageSniffer,
 }
 
-struct ResponseMetadata {
-    status: StatusCode,
-    version: Version,
-    headers: HeaderMap,
-}
-
-struct PendingRequest {
-    timestamp_unix_ms: u64,
-    metadata: RequestMetadata,
-    body: Vec<u8>,
-    trailers: Vec<HeaderMap>,
-}
-
-#[derive(Default)]
-struct PendingResponse {
-    utf8_carry: Vec<u8>,
-    carry_offset: u64,
-    carry_sequence: u64,
-    total_body_bytes: u64,
-}
-
-pub fn start(path: &Path) -> io::Result<(LogSender, LogWorker)> {
+/// Open the JSONL sink and spawn the writer thread.
+///
+/// `path` may be `-` for stdout. When `terminal_log` is set, arrival and
+/// completion lines are also printed to stderr.
+pub fn start(path: &Path, terminal_log: bool) -> io::Result<(LogSender, LogWorker)> {
     let writer: Box<dyn Write + Send> = if path == Path::new("-") {
         Box::new(io::stdout())
     } else {
@@ -144,17 +189,20 @@ pub fn start(path: &Path) -> io::Result<(LogSender, LogWorker)> {
         Box::new(file)
     };
 
-    start_with_writer(writer)
+    start_with_writer(writer, terminal_log)
 }
 
-fn start_with_writer(writer: Box<dyn Write + Send>) -> io::Result<(LogSender, LogWorker)> {
+fn start_with_writer(
+    writer: Box<dyn Write + Send>,
+    terminal_log: bool,
+) -> io::Result<(LogSender, LogWorker)> {
     let (tx, rx) = mpsc::channel();
     let healthy = Arc::new(AtomicBool::new(true));
     let worker_health = Arc::clone(&healthy);
     let thread = thread::Builder::new()
         .name("json-log-writer".to_owned())
         .spawn(move || {
-            let result = run_worker(rx, writer);
+            let result = run_worker(rx, writer, terminal_log);
             if let Err(error) = &result {
                 worker_health.store(false, Ordering::Release);
                 eprintln!("JSON log worker stopped: {error}");
@@ -174,208 +222,89 @@ impl LogWorker {
 }
 
 impl LogSender {
+    /// False once the writer has failed. The proxy then fails closed rather
+    /// than serving traffic with no audit trail.
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
     }
 
-    pub fn request_started(
-        &self,
-        id: Uuid,
-        peer: SocketAddr,
-        api_key: Option<String>,
-        authorized: bool,
-        parts: &request::Parts,
-    ) {
+    /// Record an arriving request.
+    ///
+    /// The returned guard closes the record out if the handler is dropped
+    /// before it produces a response, so an abandoned request cannot sit in the
+    /// worker's pending map forever. Call [`RequestGuard::disarm`] once a
+    /// response body has been handed to [`Self::response_body`].
+    #[must_use = "the guard closes out abandoned requests"]
+    pub fn request_started(&self, id: Uuid, info: RequestInfo) -> RequestGuard {
         self.send(LogEvent::RequestStarted {
             id,
-            timestamp_unix_ms: now_unix_ms(),
-            metadata: RequestMetadata {
-                peer,
-                api_key,
-                authorized,
-                method: parts.method.clone(),
-                uri: parts.uri.clone(),
-                version: parts.version,
-                headers: parts.headers.clone(),
-            },
+            at_unix_ms: now_unix_ms(),
+            info: Box::new(info),
         });
-    }
 
-    pub fn request_finished(&self, id: Uuid, outcome: BodyOutcome) {
-        self.send(LogEvent::RequestFinished {
+        RequestGuard {
+            logger: self.clone(),
             id,
-            completed_at_unix_ms: now_unix_ms(),
-            outcome,
-        });
+            armed: true,
+        }
     }
 
     pub fn response_started(&self, id: Uuid, parts: &response::Parts) {
         self.send(LogEvent::ResponseStarted {
             id,
-            timestamp_unix_ms: now_unix_ms(),
-            metadata: ResponseMetadata {
-                status: parts.status,
-                version: parts.version,
-                headers: parts.headers.clone(),
-            },
+            at_unix_ms: now_unix_ms(),
+            status: parts.status,
         });
     }
 
-    pub fn request_body(&self, id: Uuid, body: Body) -> Body {
-        let size_hint = body.size_hint();
-        if body.is_end_stream() {
-            self.request_finished(id, BodyOutcome::Complete);
-            return body;
-        }
-
-        // This bounded pipe preserves normal streaming backpressure. Because
-        // the pump owns the inbound body, it keeps draining for the audit log
-        // if the upstream stops consuming its side of the pipe.
-        let (tx, rx) = tokio_mpsc::channel(8);
-        spawn_request_pump(self.clone(), id, body, Some(tx));
-        Body::new(ForwardBody { rx, size_hint })
-    }
-
-    pub fn drain_request(&self, id: Uuid, body: Body) {
-        if body.is_end_stream() {
-            self.request_finished(id, BodyOutcome::Complete);
-        } else {
-            spawn_request_pump(self.clone(), id, body, None);
-        }
-    }
-
+    /// Wrap a response body so its bytes are counted and scanned for token
+    /// usage on the way to the client. The bytes themselves are never stored.
     pub fn response_body(&self, id: Uuid, body: Body) -> Body {
-        Body::new(LoggedBody::new(body, self.clone(), id))
+        Body::new(ObservedBody::new(body, self.clone(), id))
+    }
+
+    pub(crate) fn response_finished(&self, id: Uuid, outcome: BodyOutcome) {
+        self.send(LogEvent::ResponseFinished {
+            id,
+            at_unix_ms: now_unix_ms(),
+            outcome,
+        });
     }
 
     fn send(&self, event: LogEvent) {
-        // std's MPSC channel is unbounded: this call never waits for disk I/O,
-        // and it does not intentionally drop audit events. See README.md for
-        // the memory/backpressure tradeoff this implies.
+        // std's MPSC channel is unbounded, so this never waits for disk I/O and
+        // never intentionally drops an audit event.
         if self.tx.send(event).is_err() {
             self.healthy.store(false, Ordering::Release);
         }
     }
 }
 
-struct ForwardBody {
-    rx: tokio_mpsc::Receiver<Result<Frame<Bytes>, axum::Error>>,
-    size_hint: SizeHint,
-}
-
-impl HttpBody for ForwardBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(bytes) = frame.data_ref() {
-                    let length = bytes.len() as u64;
-                    let lower = self.size_hint.lower().saturating_sub(length);
-                    self.size_hint.set_lower(lower);
-                    if let Some(upper) = self.size_hint.upper() {
-                        self.size_hint.set_upper(upper.saturating_sub(length));
-                    }
-                }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            other => other,
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.rx.is_closed() && self.rx.is_empty()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.size_hint
-    }
-}
-
-struct RequestPumpGuard {
+/// Closes out a request whose handler was dropped before responding.
+pub struct RequestGuard {
     logger: LogSender,
     id: Uuid,
-    finished: bool,
+    armed: bool,
 }
 
-impl RequestPumpGuard {
-    fn finish(&mut self, outcome: BodyOutcome) {
-        if !self.finished {
-            self.finished = true;
-            self.logger.request_finished(self.id, outcome);
-        }
+impl RequestGuard {
+    /// Hand responsibility for the record over to the response body.
+    pub fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
-impl Drop for RequestPumpGuard {
+impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.finish(BodyOutcome::Aborted);
-    }
-}
-
-fn spawn_request_pump(
-    logger: LogSender,
-    id: Uuid,
-    mut body: Body,
-    mut forward: Option<tokio_mpsc::Sender<Result<Frame<Bytes>, axum::Error>>>,
-) {
-    tokio::spawn(async move {
-        let mut completion = RequestPumpGuard {
-            logger: logger.clone(),
-            id,
-            finished: false,
-        };
-
-        loop {
-            match body.frame().await {
-                Some(Ok(frame)) => {
-                    let is_trailers = frame.trailers_ref().is_some();
-                    if let Some(bytes) = frame.data_ref() {
-                        logger.send(LogEvent::RequestChunk {
-                            id,
-                            bytes: bytes.clone(),
-                        });
-                    } else if let Some(trailers) = frame.trailers_ref() {
-                        logger.send(LogEvent::RequestTrailers {
-                            id,
-                            trailers: trailers.clone(),
-                        });
-                    }
-
-                    if let Some(tx) = &forward
-                        && tx.send(Ok(frame)).await.is_err()
-                    {
-                        forward = None;
-                    }
-
-                    if is_trailers || body.is_end_stream() {
-                        completion.finish(BodyOutcome::Complete);
-                        return;
-                    }
-                }
-                Some(Err(error)) => {
-                    let message = error.to_string();
-                    if let Some(tx) = forward {
-                        let _ = tx.send(Err(error)).await;
-                    }
-                    completion.finish(BodyOutcome::Error(message));
-                    return;
-                }
-                None => {
-                    completion.finish(BodyOutcome::Complete);
-                    return;
-                }
-            }
+        if self.armed {
+            self.logger
+                .response_finished(self.id, BodyOutcome::Abandoned);
         }
-    });
+    }
 }
 
 pin_project! {
-    struct LoggedBody {
+    struct ObservedBody {
         #[pin]
         inner: Body,
         completion: CompletionGuard,
@@ -386,11 +315,9 @@ struct CompletionGuard {
     logger: LogSender,
     id: Uuid,
     finished: bool,
-    sequence: u64,
-    body_bytes: u64,
 }
 
-impl LoggedBody {
+impl ObservedBody {
     fn new(inner: Body, logger: LogSender, id: Uuid) -> Self {
         let already_finished = inner.is_end_stream();
         let mut body = Self {
@@ -399,13 +326,11 @@ impl LoggedBody {
                 logger,
                 id,
                 finished: false,
-                sequence: 0,
-                body_bytes: 0,
             },
         };
 
-        // Some zero-length bodies are never polled by Hyper. Emit their end
-        // event at construction so the request accumulator cannot leak.
+        // Hyper never polls some zero-length bodies. Emit the end event at
+        // construction so the pending-request entry cannot leak.
         if already_finished {
             body.completion.finish(BodyOutcome::Complete);
         }
@@ -413,7 +338,7 @@ impl LoggedBody {
     }
 }
 
-impl HttpBody for LoggedBody {
+impl HttpBody for ObservedBody {
     type Data = Bytes;
     type Error = axum::Error;
 
@@ -425,13 +350,14 @@ impl HttpBody for LoggedBody {
         match this.inner.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(bytes) = frame.data_ref() {
-                    this.completion.observe_data(bytes);
-                } else if let Some(trailers) = frame.trailers_ref() {
-                    this.completion.observe_trailers(trailers);
+                    this.completion.logger.send(LogEvent::ResponseChunk {
+                        id: this.completion.id,
+                        bytes: bytes.clone(),
+                    });
                 }
                 // Consumers commonly stop polling after a frame for which the
-                // inner body reports end-of-stream. Observe that transition so
-                // completion doesn't depend on a later poll returning None.
+                // inner body reports end-of-stream, so observe that transition
+                // here rather than waiting for a later `None`.
                 if this.inner.is_end_stream() {
                     this.completion.finish(BodyOutcome::Complete);
                 }
@@ -460,41 +386,12 @@ impl HttpBody for LoggedBody {
 }
 
 impl CompletionGuard {
-    fn observe_data(&mut self, bytes: &Bytes) {
-        self.logger.send(LogEvent::ResponseChunk {
-            id: self.id,
-            timestamp_unix_ms: now_unix_ms(),
-            sequence: self.sequence,
-            offset: self.body_bytes,
-            bytes: bytes.clone(),
-        });
-        self.sequence = self.sequence.saturating_add(1);
-        self.body_bytes = self.body_bytes.saturating_add(bytes.len() as u64);
-    }
-
-    fn observe_trailers(&mut self, trailers: &HeaderMap) {
-        self.logger.send(LogEvent::ResponseTrailers {
-            id: self.id,
-            timestamp_unix_ms: now_unix_ms(),
-            sequence: self.sequence,
-            trailers: trailers.clone(),
-        });
-        self.sequence = self.sequence.saturating_add(1);
-        self.finish(BodyOutcome::Complete);
-    }
-
     fn finish(&mut self, outcome: BodyOutcome) {
         if self.finished {
             return;
         }
         self.finished = true;
-
-        self.logger.send(LogEvent::ResponseFinished {
-            id: self.id,
-            timestamp_unix_ms: now_unix_ms(),
-            total_body_bytes: self.body_bytes,
-            outcome,
-        });
+        self.logger.response_finished(self.id, outcome);
     }
 }
 
@@ -504,10 +401,13 @@ impl Drop for CompletionGuard {
     }
 }
 
-fn run_worker(rx: Receiver<LogEvent>, writer: Box<dyn Write + Send>) -> io::Result<()> {
+fn run_worker(
+    rx: Receiver<LogEvent>,
+    writer: Box<dyn Write + Send>,
+    terminal_log: bool,
+) -> io::Result<()> {
     let mut writer = BufWriter::new(writer);
-    let mut pending_requests = HashMap::<Uuid, PendingRequest>::new();
-    let mut pending_responses = HashMap::<Uuid, PendingResponse>::new();
+    let mut pending = HashMap::<Uuid, Pending>::new();
     let mut dirty = false;
     let mut last_flush = Instant::now();
 
@@ -519,12 +419,7 @@ fn run_worker(rx: Receiver<LogEvent>, writer: Box<dyn Write + Send>) -> io::Resu
         };
         match rx.recv_timeout(wait) {
             Ok(event) => {
-                dirty |= handle_event(
-                    &mut writer,
-                    &mut pending_requests,
-                    &mut pending_responses,
-                    event,
-                )?;
+                dirty |= handle_event(&mut writer, &mut pending, event, terminal_log)?;
                 if dirty && last_flush.elapsed() >= FLUSH_INTERVAL {
                     writer.flush()?;
                     dirty = false;
@@ -542,26 +437,18 @@ fn run_worker(rx: Receiver<LogEvent>, writer: Box<dyn Write + Send>) -> io::Resu
         }
     }
 
-    // A body should always send an aborted event from Drop. This fallback also
-    // makes shutdown output useful if a producer itself panicked.
-    for (id, pending) in pending_requests {
-        write_request(
+    // A response body always reports an outcome from Drop, so this only runs if
+    // a producer itself panicked. Emit what we have rather than losing it.
+    let ids: Vec<Uuid> = pending.keys().copied().collect();
+    for id in ids {
+        let record = pending.remove(&id).expect("id came from the same map");
+        write_record(
             &mut writer,
             id,
-            pending,
+            record,
             now_unix_ms(),
-            BodyOutcome::Error("logger channel closed before request body finished".to_owned()),
-        )?;
-    }
-    for (id, mut pending) in pending_responses {
-        let timestamp = now_unix_ms();
-        flush_response_utf8_tail(&mut writer, id, timestamp, &mut pending)?;
-        write_response_end(
-            &mut writer,
-            id,
-            timestamp,
-            pending.total_body_bytes,
-            BodyOutcome::Error("logger channel closed before response body finished".to_owned()),
+            BodyOutcome::Error("the logger shut down before the response finished".to_owned()),
+            terminal_log,
         )?;
     }
     writer.flush()
@@ -569,451 +456,224 @@ fn run_worker(rx: Receiver<LogEvent>, writer: Box<dyn Write + Send>) -> io::Resu
 
 fn handle_event(
     writer: &mut dyn Write,
-    pending_requests: &mut HashMap<Uuid, PendingRequest>,
-    pending_responses: &mut HashMap<Uuid, PendingResponse>,
+    pending: &mut HashMap<Uuid, Pending>,
     event: LogEvent,
+    terminal_log: bool,
 ) -> io::Result<bool> {
     match event {
         LogEvent::RequestStarted {
             id,
-            timestamp_unix_ms,
-            metadata,
+            at_unix_ms,
+            info,
         } => {
-            pending_requests.insert(
+            if terminal_log {
+                eprintln!(
+                    "{}  >  {id}  {} {}  {}  from {}",
+                    format_timestamp(at_unix_ms),
+                    info.method,
+                    info.uri,
+                    info.principal(),
+                    info.peer.ip(),
+                );
+            }
+            pending.insert(
                 id,
-                PendingRequest {
-                    timestamp_unix_ms,
-                    metadata,
-                    body: Vec::new(),
-                    trailers: Vec::new(),
+                Pending {
+                    started_at_unix_ms: at_unix_ms,
+                    info,
+                    status: None,
+                    first_byte_at_unix_ms: None,
+                    response_bytes: 0,
+                    sniffer: UsageSniffer::new(),
                 },
             );
             Ok(false)
         }
-        LogEvent::RequestChunk { id, bytes } => {
-            if let Some(request) = pending_requests.get_mut(&id) {
-                request.body.extend_from_slice(&bytes);
-            }
-            Ok(false)
-        }
-        LogEvent::RequestTrailers { id, trailers } => {
-            if let Some(request) = pending_requests.get_mut(&id) {
-                request.trailers.push(trailers);
-            }
-            Ok(false)
-        }
-        LogEvent::RequestFinished {
-            id,
-            completed_at_unix_ms,
-            outcome,
-        } => {
-            if let Some(request) = pending_requests.remove(&id) {
-                write_request(writer, id, request, completed_at_unix_ms, outcome)?;
-                return Ok(true);
-            }
-            Ok(false)
-        }
         LogEvent::ResponseStarted {
             id,
-            timestamp_unix_ms,
-            metadata,
+            at_unix_ms,
+            status,
         } => {
-            pending_responses.insert(id, PendingResponse::default());
-            write_response_start(writer, id, timestamp_unix_ms, metadata).map(|()| true)
+            if let Some(entry) = pending.get_mut(&id) {
+                entry.status = Some(status);
+                entry.first_byte_at_unix_ms.get_or_insert(at_unix_ms);
+            }
+            Ok(false)
         }
-        LogEvent::ResponseChunk {
-            id,
-            timestamp_unix_ms,
-            sequence,
-            offset,
-            bytes,
-        } => write_response_chunk(
-            writer,
-            id,
-            timestamp_unix_ms,
-            sequence,
-            offset,
-            &bytes,
-            pending_responses.entry(id).or_default(),
-        )
-        .map(|()| true),
-        LogEvent::ResponseTrailers {
-            id,
-            timestamp_unix_ms,
-            sequence,
-            trailers,
-        } => {
-            let pending = pending_responses.entry(id).or_default();
-            flush_response_utf8_tail(writer, id, timestamp_unix_ms, pending)?;
-            write_response_trailers(writer, id, timestamp_unix_ms, sequence, &trailers)
-                .map(|()| true)
+        LogEvent::ResponseChunk { id, bytes } => {
+            if let Some(entry) = pending.get_mut(&id) {
+                entry.response_bytes = entry.response_bytes.saturating_add(bytes.len() as u64);
+                entry.sniffer.feed(&bytes);
+            }
+            Ok(false)
         }
         LogEvent::ResponseFinished {
             id,
-            timestamp_unix_ms,
-            total_body_bytes,
+            at_unix_ms,
             outcome,
-        } => {
-            if let Some(mut pending) = pending_responses.remove(&id) {
-                flush_response_utf8_tail(writer, id, timestamp_unix_ms, &mut pending)?;
+        } => match pending.remove(&id) {
+            Some(entry) => {
+                write_record(writer, id, entry, at_unix_ms, outcome, terminal_log)?;
+                Ok(true)
             }
-            write_response_end(writer, id, timestamp_unix_ms, total_body_bytes, outcome)
-                .map(|()| true)
-        }
+            None => Ok(false),
+        },
     }
-}
-
-#[derive(Serialize)]
-struct HeaderRecord {
-    name: String,
-    value: String,
 }
 
 #[derive(Serialize)]
 struct RequestRecord<'a> {
     event: &'static str,
     request_id: String,
-    timestamp_unix_ms: u64,
-    completed_at_unix_ms: u64,
+    started_at: String,
+    started_at_unix_ms: u64,
+    finished_at_unix_ms: u64,
+    duration_ms: u64,
+    time_to_first_byte_ms: Option<u64>,
     client_ip: String,
     client_port: u16,
-    host: Option<String>,
-    api_key: Option<&'a str>,
-    authorized: bool,
+    host: Option<&'a str>,
+    user_agent: Option<&'a str>,
     method: &'a str,
     uri: String,
-    http_version: String,
-    headers: Vec<HeaderRecord>,
-    body: Option<&'a str>,
-    body_utf8_valid: Option<bool>,
-    body_bytes_hex: Option<String>,
-    trailers: Vec<Vec<HeaderRecord>>,
+    http_version: &'static str,
+    request_content_length: Option<u64>,
+    authorized: bool,
+    auth_error: Option<&'static str>,
+    key_name: Option<&'a str>,
+    key_identifier: Option<&'a str>,
+    key_sha256: Option<&'a str>,
+    key_admin: Option<bool>,
+    status: Option<u16>,
+    response_bytes: u64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
     complete: bool,
-    termination: &'a str,
+    termination: &'static str,
     error: Option<&'a str>,
 }
 
-fn write_request(
+fn write_record(
     writer: &mut dyn Write,
     id: Uuid,
-    pending: PendingRequest,
-    completed_at_unix_ms: u64,
+    entry: Pending,
+    finished_at_unix_ms: u64,
     outcome: BodyOutcome,
+    terminal_log: bool,
 ) -> io::Result<()> {
-    let body_text = String::from_utf8_lossy(&pending.body);
-    let body_utf8_valid = matches!(body_text, Cow::Borrowed(_));
-    let (complete, termination, error) = match &outcome {
-        BodyOutcome::Complete => (true, "complete", None),
-        BodyOutcome::Aborted => (false, "body_dropped", None),
-        BodyOutcome::Error(error) => (false, "body_error", Some(error.as_str())),
-    };
-    let host = pending
-        .metadata
-        .headers
-        .get(HOST)
-        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
-        .or_else(|| pending.metadata.uri.authority().map(ToString::to_string));
-    let trailers = pending.trailers.iter().map(headers_to_records).collect();
+    let (complete, termination, error) = outcome.describe();
+    let usage = entry.sniffer.usage().unwrap_or_default();
+    let duration_ms = finished_at_unix_ms.saturating_sub(entry.started_at_unix_ms);
+    let info = &entry.info;
+
+    if terminal_log {
+        eprintln!(
+            "{}  <  {id}  {}  {}ms  in={} out={}  {}{}",
+            format_timestamp(finished_at_unix_ms),
+            entry
+                .status
+                .map_or_else(|| "---".to_owned(), |status| status.as_u16().to_string()),
+            duration_ms,
+            usage
+                .input_tokens
+                .map_or_else(|| "-".to_owned(), |tokens| tokens.to_string()),
+            usage
+                .output_tokens
+                .map_or_else(|| "-".to_owned(), |tokens| tokens.to_string()),
+            info.principal(),
+            if complete { "" } else { "  (incomplete)" },
+        );
+    }
+
     let record = RequestRecord {
         event: "request",
         request_id: id.to_string(),
-        timestamp_unix_ms: pending.timestamp_unix_ms,
-        completed_at_unix_ms,
-        client_ip: pending.metadata.peer.ip().to_string(),
-        client_port: pending.metadata.peer.port(),
-        host,
-        api_key: pending.metadata.api_key.as_deref(),
-        authorized: pending.metadata.authorized,
-        method: pending.metadata.method.as_str(),
-        uri: pending.metadata.uri.to_string(),
-        http_version: version_string(pending.metadata.version),
-        headers: headers_to_records(&pending.metadata.headers),
-        body: Some(body_text.as_ref()),
-        body_utf8_valid: Some(body_utf8_valid),
-        body_bytes_hex: (!body_utf8_valid).then(|| encode_hex(&pending.body)),
-        trailers,
+        started_at: format_timestamp(entry.started_at_unix_ms),
+        started_at_unix_ms: entry.started_at_unix_ms,
+        finished_at_unix_ms,
+        duration_ms,
+        time_to_first_byte_ms: entry
+            .first_byte_at_unix_ms
+            .map(|at| at.saturating_sub(entry.started_at_unix_ms)),
+        client_ip: info.peer.ip().to_string(),
+        client_port: info.peer.port(),
+        host: info.host.as_deref(),
+        user_agent: info.user_agent.as_deref(),
+        method: info.method.as_str(),
+        uri: info.uri.to_string(),
+        http_version: version_string(info.version),
+        request_content_length: info.content_length,
+        authorized: info.authorized,
+        auth_error: info.auth_error,
+        key_name: info
+            .identity
+            .as_ref()
+            .map(|identity| identity.name.as_str()),
+        key_identifier: info
+            .identity
+            .as_ref()
+            .map(|identity| identity.identifier.as_str()),
+        key_sha256: info.key_sha256.as_deref(),
+        key_admin: info.identity.as_ref().map(|identity| identity.admin),
+        status: entry.status.map(|status| status.as_u16()),
+        response_bytes: entry.response_bytes,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
         complete,
         termination,
         error,
     };
 
-    write_json_line(writer, &record)
-}
-
-#[derive(Serialize)]
-struct ResponseStartRecord {
-    event: &'static str,
-    request_id: String,
-    timestamp_unix_ms: u64,
-    status: u16,
-    http_version: String,
-    headers: Vec<HeaderRecord>,
-}
-
-fn write_response_start(
-    writer: &mut dyn Write,
-    id: Uuid,
-    timestamp_unix_ms: u64,
-    metadata: ResponseMetadata,
-) -> io::Result<()> {
-    write_json_line(
-        writer,
-        &ResponseStartRecord {
-            event: "response_start",
-            request_id: id.to_string(),
-            timestamp_unix_ms,
-            status: metadata.status.as_u16(),
-            http_version: version_string(metadata.version),
-            headers: headers_to_records(&metadata.headers),
-        },
-    )
-}
-
-#[derive(Serialize)]
-struct ResponseBodyRecord<'a> {
-    event: &'static str,
-    request_id: String,
-    timestamp_unix_ms: u64,
-    sequence: u64,
-    offset: u64,
-    source_offset: u64,
-    source_body_bytes: usize,
-    decoded_body_bytes: usize,
-    utf8_pending_bytes: usize,
-    utf8_tail: bool,
-    body: &'a str,
-    body_utf8_valid: bool,
-    body_bytes_hex: Option<String>,
-}
-
-fn write_response_chunk(
-    writer: &mut dyn Write,
-    id: Uuid,
-    timestamp_unix_ms: u64,
-    sequence: u64,
-    offset: u64,
-    bytes: &[u8],
-    pending: &mut PendingResponse,
-) -> io::Result<()> {
-    pending.total_body_bytes = pending
-        .total_body_bytes
-        .max(offset.saturating_add(bytes.len() as u64));
-    let had_carry = !pending.utf8_carry.is_empty();
-    let previous_carry_sequence = pending.carry_sequence;
-    let decoded_offset = if !had_carry {
-        offset
-    } else {
-        pending.carry_offset
-    };
-    let mut combined = std::mem::take(&mut pending.utf8_carry);
-    let previous_carry_len = combined.len();
-    combined.extend_from_slice(bytes);
-    let decoded = decode_utf8(&combined, false);
-    pending.utf8_carry = combined[decoded.consumed..].to_vec();
-    pending.carry_offset = decoded_offset.saturating_add(decoded.consumed as u64);
-    if !pending.utf8_carry.is_empty() {
-        pending.carry_sequence = if had_carry && decoded.consumed < previous_carry_len {
-            previous_carry_sequence
-        } else {
-            sequence
-        };
-    }
-
-    write_json_line(
-        writer,
-        &ResponseBodyRecord {
-            event: "response_body",
-            request_id: id.to_string(),
-            timestamp_unix_ms,
-            sequence,
-            offset: decoded_offset,
-            source_offset: offset,
-            source_body_bytes: bytes.len(),
-            decoded_body_bytes: decoded.consumed,
-            utf8_pending_bytes: pending.utf8_carry.len(),
-            utf8_tail: false,
-            body: &decoded.text,
-            body_utf8_valid: decoded.valid,
-            body_bytes_hex: (!decoded.valid).then(|| encode_hex(&combined[..decoded.consumed])),
-        },
-    )
-}
-
-fn flush_response_utf8_tail(
-    writer: &mut dyn Write,
-    id: Uuid,
-    timestamp_unix_ms: u64,
-    pending: &mut PendingResponse,
-) -> io::Result<()> {
-    if pending.utf8_carry.is_empty() {
-        return Ok(());
-    }
-
-    let bytes = std::mem::take(&mut pending.utf8_carry);
-    let decoded = decode_utf8(&bytes, true);
-    write_json_line(
-        writer,
-        &ResponseBodyRecord {
-            event: "response_body",
-            request_id: id.to_string(),
-            timestamp_unix_ms,
-            sequence: pending.carry_sequence,
-            offset: pending.carry_offset,
-            source_offset: pending.carry_offset,
-            source_body_bytes: 0,
-            decoded_body_bytes: decoded.consumed,
-            utf8_pending_bytes: 0,
-            utf8_tail: true,
-            body: &decoded.text,
-            body_utf8_valid: decoded.valid,
-            body_bytes_hex: (!decoded.valid).then(|| encode_hex(&bytes)),
-        },
-    )
-}
-
-struct DecodedUtf8 {
-    text: String,
-    consumed: usize,
-    valid: bool,
-}
-
-fn decode_utf8(bytes: &[u8], final_chunk: bool) -> DecodedUtf8 {
-    let mut text = String::with_capacity(bytes.len());
-    let mut consumed = 0;
-    let mut valid = true;
-
-    while consumed < bytes.len() {
-        match std::str::from_utf8(&bytes[consumed..]) {
-            Ok(remainder) => {
-                text.push_str(remainder);
-                consumed = bytes.len();
-            }
-            Err(error) => {
-                let valid_end = consumed + error.valid_up_to();
-                // from_utf8 reported this prefix as valid.
-                text.push_str(
-                    std::str::from_utf8(&bytes[consumed..valid_end])
-                        .expect("validated UTF-8 prefix"),
-                );
-                consumed = valid_end;
-
-                match error.error_len() {
-                    Some(length) => {
-                        text.push('\u{fffd}');
-                        consumed += length;
-                        valid = false;
-                    }
-                    None if final_chunk => {
-                        text.push('\u{fffd}');
-                        consumed = bytes.len();
-                        valid = false;
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-
-    DecodedUtf8 {
-        text,
-        consumed,
-        valid,
-    }
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        encoded.push(DIGITS[(byte >> 4) as usize] as char);
-        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-#[derive(Serialize)]
-struct ResponseTrailersRecord {
-    event: &'static str,
-    request_id: String,
-    timestamp_unix_ms: u64,
-    sequence: u64,
-    trailers: Vec<HeaderRecord>,
-}
-
-fn write_response_trailers(
-    writer: &mut dyn Write,
-    id: Uuid,
-    timestamp_unix_ms: u64,
-    sequence: u64,
-    trailers: &HeaderMap,
-) -> io::Result<()> {
-    write_json_line(
-        writer,
-        &ResponseTrailersRecord {
-            event: "response_trailers",
-            request_id: id.to_string(),
-            timestamp_unix_ms,
-            sequence,
-            trailers: headers_to_records(trailers),
-        },
-    )
-}
-
-#[derive(Serialize)]
-struct ResponseEndRecord<'a> {
-    event: &'static str,
-    request_id: String,
-    timestamp_unix_ms: u64,
-    total_body_bytes: u64,
-    complete: bool,
-    termination: &'a str,
-    error: Option<&'a str>,
-}
-
-fn write_response_end(
-    writer: &mut dyn Write,
-    id: Uuid,
-    timestamp_unix_ms: u64,
-    total_body_bytes: u64,
-    outcome: BodyOutcome,
-) -> io::Result<()> {
-    let (complete, termination, error) = match &outcome {
-        BodyOutcome::Complete => (true, "complete", None),
-        BodyOutcome::Aborted => (false, "body_dropped", None),
-        BodyOutcome::Error(error) => (false, "body_error", Some(error.as_str())),
-    };
-    write_json_line(
-        writer,
-        &ResponseEndRecord {
-            event: "response_end",
-            request_id: id.to_string(),
-            timestamp_unix_ms,
-            total_body_bytes,
-            complete,
-            termination,
-            error,
-        },
-    )
-}
-
-fn headers_to_records(headers: &HeaderMap) -> Vec<HeaderRecord> {
-    headers
-        .iter()
-        .map(|(name, value)| HeaderRecord {
-            name: name.as_str().to_owned(),
-            value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
-        })
-        .collect()
-}
-
-fn version_string(version: Version) -> String {
-    format!("{version:?}")
-}
-
-fn write_json_line(writer: &mut dyn Write, value: &impl Serialize) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, value).map_err(io::Error::other)?;
+    serde_json::to_writer(&mut *writer, &record).map_err(io::Error::other)?;
     writer.write_all(b"\n")
+}
+
+const fn version_string(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2.0",
+        Version::HTTP_3 => "HTTP/3.0",
+        _ => "unknown",
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` from Unix milliseconds.
+pub fn format_timestamp(unix_ms: u64) -> String {
+    let seconds = unix_ms / 1_000;
+    let millis = unix_ms % 1_000;
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    let time = seconds % 86_400;
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        time / 3_600,
+        (time % 3_600) / 60,
+        time % 60,
+    )
+}
+
+/// Howard Hinnant's days-from-Unix-epoch to proleptic Gregorian date.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
+
+    (year + i64::from(month <= 2), month, day)
 }
 
 fn now_unix_ms() -> u64 {
@@ -1027,13 +687,17 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, net::Ipv4Addr, time::Instant};
+    use std::{fs, net::Ipv4Addr};
 
     use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::Value;
 
     use super::*;
+    use crate::{
+        auth::{KeyStore, authenticate},
+        keys::KeyRecord,
+    };
 
     struct FailingWriter;
 
@@ -1047,16 +711,88 @@ mod tests {
         }
     }
 
+    fn store_and_key() -> (KeyStore, String) {
+        let (record, key) = KeyRecord::generate("alice", true).unwrap();
+        (KeyStore::from_records(vec![record]).unwrap(), key)
+    }
+
+    async fn record_for(response_body: &'static str) -> Value {
+        let path = std::env::temp_dir().join(format!("proxy-log-{}.jsonl", Uuid::new_v4()));
+        let (logger, worker) = start(&path, false).unwrap();
+        let (store, key) = store_and_key();
+        let id = Uuid::new_v4();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(HOST, "localhost:3000")
+            .header(USER_AGENT, "openai-python/1.0")
+            .header("authorization", format!("Bearer {key}"))
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+        let auth = authenticate(&parts.headers, &store);
+        logger
+            .request_started(
+                id,
+                RequestInfo::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)), &parts, &auth),
+            )
+            .disarm();
+
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .unwrap();
+        let (response_parts, ()) = response.into_parts();
+        logger.response_started(id, &response_parts);
+        let body = logger.response_body(id, Body::from(response_body));
+        assert_eq!(body.collect().await.unwrap().to_bytes(), response_body);
+
+        drop(logger);
+        worker.join().unwrap();
+        let lines = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let records: Vec<Value> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1, "expected exactly one record per request");
+
+        records.into_iter().next().unwrap()
+    }
+
     #[test]
     fn writer_failure_marks_the_logger_unhealthy() {
-        let (logger, worker) = start_with_writer(Box::new(FailingWriter)).unwrap();
+        let (logger, worker) = start_with_writer(Box::new(FailingWriter), false).unwrap();
+        let (store, key) = store_and_key();
         let id = Uuid::new_v4();
+
+        let request = Request::builder()
+            .uri("/v1/models")
+            .header("authorization", format!("Bearer {key}"))
+            .body(())
+            .unwrap();
+        let (request_parts, ()) = request.into_parts();
+        let auth = authenticate(&request_parts.headers, &store);
+        logger
+            .request_started(
+                id,
+                RequestInfo::new(
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)),
+                    &request_parts,
+                    &auth,
+                ),
+            )
+            .disarm();
+
         let response = axum::response::Response::builder()
             .status(StatusCode::OK)
             .body(())
             .unwrap();
         let (parts, ()) = response.into_parts();
         logger.response_started(id, &parts);
+        logger.response_finished(id, BodyOutcome::Complete);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while logger.is_healthy() && Instant::now() < deadline {
@@ -1068,79 +804,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_is_one_json_record_after_the_entire_body() {
-        let path = std::env::temp_dir().join(format!("proxy-log-{}.jsonl", Uuid::new_v4()));
-        let (logger, worker) = start(&path).unwrap();
-        let id = Uuid::new_v4();
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/responses")
-            .header(HOST, "localhost:3000")
-            .header("authorization", "Bearer foobar")
-            .body(())
-            .unwrap();
-        let (parts, ()) = request.into_parts();
-        logger.request_started(
-            id,
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)),
-            Some("foobar".to_owned()),
-            true,
-            &parts,
-        );
-        let body = logger.request_body(id, Body::from("hello\nworld"));
-        assert_eq!(body.collect().await.unwrap().to_bytes(), "hello\nworld");
+    async fn one_record_carries_metadata_and_token_counts() {
+        let record = record_for(
+            r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}"#,
+        )
+        .await;
 
-        drop(logger);
-        worker.join().unwrap();
-        let lines = fs::read_to_string(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        let records: Vec<Value> = lines
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0]["event"], "request");
-        assert_eq!(records[0]["request_id"], id.to_string());
-        assert_eq!(records[0]["client_ip"], "127.0.0.1");
-        assert_eq!(records[0]["host"], "localhost:3000");
-        assert_eq!(records[0]["api_key"], "foobar");
-        assert_eq!(records[0]["body"], "hello\nworld");
-        assert_eq!(records[0]["complete"], true);
+        assert_eq!(record["event"], "request");
+        assert_eq!(record["client_ip"], "127.0.0.1");
+        assert_eq!(record["client_port"], 4242);
+        assert_eq!(record["host"], "localhost:3000");
+        assert_eq!(record["user_agent"], "openai-python/1.0");
+        assert_eq!(record["method"], "POST");
+        assert_eq!(record["uri"], "/v1/chat/completions");
+        assert_eq!(record["authorized"], true);
+        assert_eq!(record["key_name"], "alice");
+        assert_eq!(record["key_admin"], true);
+        assert_eq!(record["status"], 200);
+        assert_eq!(record["input_tokens"], 12);
+        assert_eq!(record["output_tokens"], 5);
+        assert_eq!(record["total_tokens"], 17);
+        assert_eq!(record["complete"], true);
+        assert!(record["started_at"].as_str().unwrap().ends_with('Z'));
+        assert!(record["key_sha256"].as_str().unwrap().len() == 64);
     }
 
     #[tokio::test]
-    async fn response_is_logged_as_stream_events() {
-        let path = std::env::temp_dir().join(format!("proxy-log-{}.jsonl", Uuid::new_v4()));
-        let (logger, worker) = start(&path).unwrap();
-        let id = Uuid::new_v4();
-        let response = axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .body(())
-            .unwrap();
-        let (parts, ()) = response.into_parts();
-        logger.response_started(id, &parts);
-        let body = logger.response_body(id, Body::from("data: hello\n\n"));
-        assert_eq!(body.collect().await.unwrap().to_bytes(), "data: hello\n\n");
+    async fn no_body_content_reaches_the_log() {
+        let record = record_for(r#"{"choices":[{"message":{"content":"a secret answer"}}]}"#).await;
+        let line = serde_json::to_string(&record).unwrap();
 
-        drop(logger);
-        worker.join().unwrap();
-        let lines = fs::read_to_string(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        let records: Vec<Value> = lines
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        assert!(!line.contains("secret answer"));
+        assert!(!line.contains("choices"));
+        assert_eq!(record["input_tokens"], Value::Null);
+        assert_eq!(record["output_tokens"], Value::Null);
+        assert!(record["response_bytes"].as_u64().unwrap() > 0);
+    }
 
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[0]["event"], "response_start");
-        assert_eq!(records[1]["event"], "response_body");
-        assert_eq!(records[1]["body"], "data: hello\n\n");
-        assert_eq!(records[2]["event"], "response_end");
-        assert!(
-            records
-                .iter()
-                .all(|record| record["request_id"] == id.to_string())
+    #[tokio::test]
+    async fn streaming_usage_is_recovered_from_the_final_chunk() {
+        let record = record_for(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":8,\"total_tokens\":12}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+
+        assert_eq!(record["input_tokens"], 4);
+        assert_eq!(record["output_tokens"], 8);
+    }
+
+    #[test]
+    fn timestamps_format_as_utc_iso8601() {
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_timestamp(1_755_000_000_123),
+            "2025-08-12T12:00:00.123Z"
+        );
+        assert_eq!(
+            format_timestamp(1_709_164_800_000),
+            "2024-02-29T00:00:00.000Z"
         );
     }
 }
