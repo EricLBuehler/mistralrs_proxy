@@ -136,6 +136,9 @@ async fn proxies_an_authorized_request_and_logs_one_record_with_token_counts() {
     assert_eq!(record["output_tokens"], 7);
     assert_eq!(record["total_tokens"], 38);
     assert_eq!(record["response_bytes"], UPSTREAM_BODY.len());
+    // The upstream answered with text/event-stream.
+    assert_eq!(record["streaming"], true);
+    assert!(record["time_to_first_byte_ms"].is_u64());
     assert_eq!(record["complete"], true);
     assert_eq!(record["termination"], "complete");
     assert_eq!(
@@ -227,6 +230,8 @@ async fn an_unknown_key_is_rejected_before_the_upstream_and_logged_by_digest() {
     assert_eq!(record["auth_error"], "invalid_api_key");
     assert_eq!(record["status"], 401);
     assert_eq!(record["key_name"], Value::Null);
+    // A locally generated JSON error is not a stream.
+    assert_eq!(record["streaming"], false);
     // The digest of an unknown key is still recorded, so repeats are visible.
     assert_eq!(record["key_sha256"].as_str().unwrap().len(), 64);
 }

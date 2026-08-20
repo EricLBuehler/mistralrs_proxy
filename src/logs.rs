@@ -45,6 +45,7 @@ pub struct LogRecord {
     pub key_sha256: Option<String>,
     pub key_admin: Option<bool>,
     pub status: Option<u16>,
+    pub streaming: bool,
     pub response_bytes: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -216,6 +217,30 @@ pub struct PathTotals {
     pub output_tokens: u64,
 }
 
+/// Nearest-rank p50/p95/max over one sample set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Distribution {
+    /// How many records contributed. Rows are built only from records that
+    /// carry the value, so this is not always the total request count.
+    pub samples: usize,
+    pub p50: u64,
+    pub p95: u64,
+    pub max: u64,
+}
+
+impl Distribution {
+    fn from_values(mut values: Vec<u64>) -> Self {
+        values.sort_unstable();
+
+        Self {
+            samples: values.len(),
+            p50: percentile(&values, 50),
+            p95: percentile(&values, 95),
+            max: values.last().copied().unwrap_or(0),
+        }
+    }
+}
+
 /// Aggregate view of a set of records.
 #[derive(Clone, Debug, Default)]
 pub struct Summary {
@@ -223,6 +248,8 @@ pub struct Summary {
     pub authorized: usize,
     pub rejected: usize,
     pub incomplete: usize,
+    pub streaming: usize,
+    pub non_streaming: usize,
     pub informational: usize,
     pub successful: usize,
     pub redirected: usize,
@@ -234,9 +261,20 @@ pub struct Summary {
     pub response_bytes: u64,
     pub first_at: Option<String>,
     pub last_at: Option<String>,
-    pub median_ms: u64,
-    pub p95_ms: u64,
-    pub max_ms: u64,
+    /// Prompt sizes, over the requests that reported usage.
+    pub input_tokens_seen: Distribution,
+    /// Completion sizes, over the requests that reported usage.
+    pub output_tokens_seen: Distribution,
+    /// Time to the first response byte over streaming responses only, which is
+    /// the time to the first generated token. A non-streaming response does not
+    /// send its head until generation has finished, so including those would
+    /// just restate total latency.
+    pub first_token_ms: Distribution,
+    /// Whole-request latency divided by output tokens, in microseconds. This
+    /// is the number that is not confounded by how much the model wrote.
+    pub per_output_token_us: Distribution,
+    /// End-to-end request latency, in milliseconds.
+    pub latency_ms: Distribution,
     /// Sorted by request count, descending.
     pub by_key: Vec<(String, KeyTotals)>,
     /// Sorted by request count, descending.
@@ -250,7 +288,11 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
     };
     let mut keys: HashMap<&str, KeyTotals> = HashMap::new();
     let mut paths: HashMap<&str, PathTotals> = HashMap::new();
-    let mut durations = Vec::with_capacity(records.len());
+    let mut latencies = Vec::with_capacity(records.len());
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut first_tokens = Vec::new();
+    let mut per_token = Vec::new();
 
     for record in records {
         if record.authorized {
@@ -260,6 +302,12 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
         }
         if !record.complete {
             summary.incomplete += 1;
+        }
+        if record.streaming {
+            summary.streaming += 1;
+        } else if record.status.is_some_and(|status| status < 400) {
+            // Only count served responses; a rejected request never had a shape.
+            summary.non_streaming += 1;
         }
         match record.status {
             None => summary.no_status += 1,
@@ -277,7 +325,20 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
         summary.input_tokens = summary.input_tokens.saturating_add(input);
         summary.output_tokens = summary.output_tokens.saturating_add(output);
         summary.response_bytes = summary.response_bytes.saturating_add(record.response_bytes);
-        durations.push(record.duration_ms);
+        latencies.push(record.duration_ms);
+        if let Some(tokens) = record.input_tokens {
+            inputs.push(tokens);
+        }
+        if let Some(tokens) = record.output_tokens {
+            outputs.push(tokens);
+        }
+        if let Some(ms) = record.time_to_first_byte_ms.filter(|_| record.streaming) {
+            first_tokens.push(ms);
+        }
+        // Only requests that actually generated something can have a rate.
+        if let Some(tokens) = record.output_tokens.filter(|tokens| *tokens > 0) {
+            per_token.push(record.duration_ms.saturating_mul(1_000) / tokens);
+        }
 
         let key = keys.entry(record.key_bucket()).or_default();
         key.requests += 1;
@@ -303,10 +364,11 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
         .max_by_key(|record| record.started_at_unix_ms)
         .map(|record| record.started_at.clone());
 
-    durations.sort_unstable();
-    summary.median_ms = percentile(&durations, 50);
-    summary.p95_ms = percentile(&durations, 95);
-    summary.max_ms = durations.last().copied().unwrap_or(0);
+    summary.latency_ms = Distribution::from_values(latencies);
+    summary.input_tokens_seen = Distribution::from_values(inputs);
+    summary.output_tokens_seen = Distribution::from_values(outputs);
+    summary.first_token_ms = Distribution::from_values(first_tokens);
+    summary.per_output_token_us = Distribution::from_values(per_token);
 
     summary.by_key = sorted_by_requests(keys, |totals| totals.requests);
     summary.by_path = sorted_by_requests(paths, |totals| totals.requests);
@@ -364,6 +426,15 @@ pub fn thousands(value: u64) -> String {
     }
 
     grouped
+}
+
+/// A sub-millisecond-capable duration, for per-token rates.
+pub fn rate(micros: u64) -> String {
+    match micros {
+        micros if micros < 1_000 => format!("{micros}\u{b5}s"),
+        micros if micros < 1_000_000 => format!("{:.1}ms", micros as f64 / 1_000.0),
+        micros => format!("{:.1}s", micros as f64 / 1_000_000.0),
+    }
 }
 
 /// A duration in the largest unit that keeps it readable.
@@ -444,11 +515,22 @@ pub fn summary_lines(path: &Path, summary: &Summary, malformed: u64) -> Vec<Stri
         thousands(summary.input_tokens + summary.output_tokens),
     ));
     lines.push(format!(
-        "  latency    p50 {}   p95 {}   max {}",
-        duration(summary.median_ms),
-        duration(summary.p95_ms),
-        duration(summary.max_ms),
+        "  shape      {:>10} streaming   {} non-streaming",
+        thousands(summary.streaming as u64),
+        thousands(summary.non_streaming as u64),
     ));
+
+    lines.push(String::new());
+    lines.push(format!(
+        "  {:<20}{:>12}{:>12}{:>12}{:>10}",
+        "", "P50", "P95", "MAX", "SAMPLES"
+    ));
+    for (name, row) in percentile_rows(summary) {
+        lines.push(format!(
+            "  {:<20}{:>12}{:>12}{:>12}{:>10}",
+            name, row.p50, row.p95, row.max, row.samples
+        ));
+    }
 
     lines.push(String::new());
     lines.push(format!(
@@ -509,6 +591,55 @@ fn pipe_ok(error: io::Error) -> io::Result<()> {
     }
 }
 
+/// One formatted percentile row.
+pub struct PercentileRow {
+    pub p50: String,
+    pub p95: String,
+    pub max: String,
+    pub samples: String,
+}
+
+fn formatted(distribution: Distribution, render: impl Fn(u64) -> String) -> PercentileRow {
+    if distribution.samples == 0 {
+        return PercentileRow {
+            p50: "-".to_owned(),
+            p95: "-".to_owned(),
+            max: "-".to_owned(),
+            samples: "0".to_owned(),
+        };
+    }
+
+    PercentileRow {
+        p50: render(distribution.p50),
+        p95: render(distribution.p95),
+        max: render(distribution.max),
+        samples: thousands(distribution.samples as u64),
+    }
+}
+
+/// The percentile table, in the order both views present it.
+///
+/// Token sizes come first because they describe the workload; the per-token
+/// rate is the latency number that does not move with completion length.
+pub fn percentile_rows(summary: &Summary) -> Vec<(&'static str, PercentileRow)> {
+    vec![
+        (
+            "input tokens",
+            formatted(summary.input_tokens_seen, thousands),
+        ),
+        (
+            "output tokens",
+            formatted(summary.output_tokens_seen, thousands),
+        ),
+        ("first token", formatted(summary.first_token_ms, duration)),
+        (
+            "per output token",
+            formatted(summary.per_output_token_us, rate),
+        ),
+        ("total latency", formatted(summary.latency_ms, duration)),
+    ]
+}
+
 pub(crate) fn truncate(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_owned();
@@ -537,7 +668,7 @@ mod tests {
                     "duration_ms":100,"method":"POST","uri":"/v1/chat/completions?stream=true",
                     "key_name":"alice","key_identifier":"AAAAAAAA","status":200,"authorized":true,
                     "input_tokens":100,"output_tokens":10,"response_bytes":50,"complete":true,
-                    "termination":"complete"}"#,
+                    "streaming":true,"time_to_first_byte_ms":40,"termination":"complete"}"#,
             ),
             record(
                 r#"{"request_id":"b","started_at":"2026-08-20T10:00:01.000Z","started_at_unix_ms":200,
@@ -566,8 +697,9 @@ mod tests {
         assert_eq!(summary.client_errors, 1);
         assert_eq!(summary.input_tokens, 120);
         assert_eq!(summary.output_tokens, 15);
-        assert_eq!(summary.max_ms, 2000);
-        assert_eq!(summary.median_ms, 300);
+        assert_eq!(summary.latency_ms.max, 2000);
+        assert_eq!(summary.latency_ms.p50, 300);
+        assert_eq!(summary.latency_ms.samples, 3);
         assert_eq!(
             summary.first_at.as_deref(),
             Some("2026-08-20T10:00:00.000Z")
@@ -598,7 +730,8 @@ mod tests {
         let summary = summarize(&[]);
 
         assert_eq!(summary.requests, 0);
-        assert_eq!(summary.median_ms, 0);
+        assert_eq!(summary.latency_ms.p50, 0);
+        assert_eq!(summary.latency_ms.samples, 0);
         assert!(summary.by_key.is_empty());
         assert!(summary.first_at.is_none());
     }
@@ -716,7 +849,11 @@ mod tests {
         assert!(text.contains("authorized 2   rejected 1"), "{text}");
         assert!(text.contains("2xx 2   3xx 0   4xx 1"), "{text}");
         assert!(text.contains("120 in   15 out   135 total"), "{text}");
-        assert!(text.contains("p50 300ms"), "{text}");
+        assert!(text.contains("P50"), "{text}");
+        assert!(text.contains("total latency"), "{text}");
+        assert!(text.contains("per output token"), "{text}");
+        assert!(text.contains("first token"), "{text}");
+        assert!(text.contains("1 streaming   1 non-streaming"), "{text}");
         assert!(text.contains("alice"), "{text}");
         assert!(text.contains("/v1/chat/completions"), "{text}");
     }
@@ -739,6 +876,106 @@ mod tests {
         assert_eq!(duration(999), "999ms");
         assert_eq!(duration(3_140), "3.1s");
         assert_eq!(duration(125_000), "2m05s");
+    }
+
+    #[test]
+    fn token_percentiles_only_count_requests_that_reported_usage() {
+        let summary = summarize(&sample());
+
+        // The 401 reported no usage, so it is not a zero-token sample.
+        // Prompts were 100 and 20 tokens; nearest rank takes the lower of two.
+        assert_eq!(summary.input_tokens_seen.samples, 2);
+        assert_eq!(summary.input_tokens_seen.p50, 20);
+        assert_eq!(summary.input_tokens_seen.max, 100);
+        assert_eq!(summary.output_tokens_seen.samples, 2);
+        assert_eq!(summary.output_tokens_seen.p50, 5);
+        assert_eq!(summary.output_tokens_seen.max, 10);
+
+        // Latency, by contrast, is known for every request.
+        assert_eq!(summary.latency_ms.samples, 3);
+    }
+
+    #[test]
+    fn the_per_token_rate_normalises_latency_by_completion_length() {
+        // 100ms for 10 tokens and 300ms for 5 tokens: the second is slower per
+        // token even though both are quick overall.
+        let summary = summarize(&sample());
+
+        assert_eq!(summary.per_output_token_us.samples, 2);
+        assert_eq!(summary.per_output_token_us.p50, 10_000);
+        assert_eq!(summary.per_output_token_us.max, 60_000);
+    }
+
+    #[test]
+    fn a_request_that_generated_nothing_has_no_rate() {
+        let refused = record(r#"{"request_id":"x","duration_ms":5,"status":401,"complete":true}"#);
+        let empty = record(
+            r#"{"request_id":"y","duration_ms":5,"status":200,"complete":true,"output_tokens":0}"#,
+        );
+
+        let summary = summarize(&[refused, empty]);
+
+        assert_eq!(summary.per_output_token_us.samples, 0);
+        assert_eq!(summary.latency_ms.samples, 2);
+    }
+
+    #[test]
+    fn a_row_with_no_samples_renders_as_dashes() {
+        let rows = percentile_rows(&summarize(&[]));
+        let (name, row) = &rows[0];
+
+        assert_eq!(*name, "input tokens");
+        assert_eq!(row.p50, "-");
+        assert_eq!(row.samples, "0");
+    }
+
+    #[test]
+    fn rates_format_from_microseconds_up() {
+        assert_eq!(rate(0), "0\u{b5}s");
+        assert_eq!(rate(940), "940\u{b5}s");
+        assert_eq!(rate(1_400), "1.4ms");
+        assert_eq!(rate(2_500_000), "2.5s");
+    }
+
+    #[test]
+    fn the_first_token_row_covers_streaming_responses_only() {
+        let summary = summarize(&sample());
+
+        // Only the SSE response has a meaningful time to first token.
+        assert_eq!(summary.streaming, 1);
+        assert_eq!(summary.non_streaming, 1);
+        assert_eq!(summary.first_token_ms.samples, 1);
+        assert_eq!(summary.first_token_ms.p50, 40);
+
+        let (name, _) = &percentile_rows(&summary)[2];
+        assert_eq!(*name, "first token");
+    }
+
+    #[test]
+    fn a_non_streaming_first_byte_is_not_sampled() {
+        // Its head does not arrive until generation is done, so this value
+        // would only restate total latency.
+        let buffered = record(
+            r#"{"request_id":"z","duration_ms":900,"status":200,"complete":true,
+                "streaming":false,"time_to_first_byte_ms":880,"output_tokens":30}"#,
+        );
+
+        let summary = summarize(&[buffered]);
+
+        assert_eq!(summary.first_token_ms.samples, 0);
+        assert_eq!(summary.non_streaming, 1);
+        assert_eq!(summary.latency_ms.samples, 1);
+    }
+
+    #[test]
+    fn a_rejected_request_has_no_shape() {
+        let refused = record(r#"{"request_id":"r","status":401,"complete":true}"#);
+
+        let summary = summarize(&[refused]);
+
+        assert_eq!(summary.streaming, 0);
+        assert_eq!(summary.non_streaming, 0);
+        assert_eq!(summary.rejected, 1);
     }
 
     #[test]

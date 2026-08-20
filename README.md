@@ -109,7 +109,7 @@ name and identifier, client address, method and path, status, duration, and the
 input and output token counts:
 
 ```json
-{"event":"request","request_id":"517e8f4e-...","started_at":"2026-08-20T13:50:24.447Z","duration_ms":1,"client_ip":"127.0.0.1","method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"HFTLdymp","status":200,"input_tokens":42,"output_tokens":13,"total_tokens":55,"complete":true}
+{"event":"request","request_id":"517e8f4e-...","started_at":"2026-08-20T13:50:24.447Z","duration_ms":652,"time_to_first_byte_ms":256,"client_ip":"127.0.0.1","method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"HFTLdymp","status":200,"streaming":true,"input_tokens":480,"output_tokens":12,"total_tokens":492,"complete":true}
 ```
 
 Streaming requests produce one record too, written when the stream ends. Token
@@ -131,8 +131,9 @@ it only reads, and picks up new requests as they land.
 
 Two views, `tab` to switch:
 
-- **Summary** — request and status counts, total tokens, p50/p95/max latency,
-  and totals broken down by key and by endpoint.
+- **Summary** — request and status counts, total tokens, the streaming mix,
+  p50/p95/max for prompt size, completion size, time to first token, per-token
+  latency and total latency, and totals broken down by key and by endpoint.
 - **Requests** — every request, newest first, with the full record for whichever
   one is selected.
 
@@ -153,21 +154,42 @@ mistralrs_proxy logs --summary
 
 ```text
 proxy.jsonl
-13 requests from 2026-08-20T14:59:17.472Z to 2026-08-20T14:59:18.073Z
+10 requests from 2026-08-20T15:26:33.966Z to 2026-08-20T15:26:37.827Z
 
-  requests           13   authorized 11   rejected 2   incomplete 0
-  statuses   2xx 11   3xx 0   4xx 2   5xx 0   none 0
-  tokens            357 in   113 out   470 total
-  latency    p50 1ms   p95 163ms   max 163ms
+  requests           10   authorized 9   rejected 1   incomplete 0
+  statuses   2xx 9   3xx 0   4xx 1   5xx 0   none 0
+  tokens          1,760 in   44 out   1,804 total
+  shape               6 streaming   3 non-streaming
+
+                               P50         P95         MAX   SAMPLES
+  input tokens                 160         480         480         9
+  output tokens                  4          12          12         9
+  first token                255ms       256ms       256ms         6
+  per output token          95.8ms      98.8ms      98.8ms         9
+  total latency              383ms       652ms       652ms        10
 
   KEY                       REQUESTS            IN           OUT   ERRORS
-  alice                            8           336           104        0
-  bot                              3            21             9        0
-  (unauthenticated)                2             0             0        2
+  alice                            9         1,760            44        0
+  (unauthenticated)                1             0             0        1
 
   ENDPOINT                            REQUESTS            IN           OUT
-  /v1/chat/completions                      11           357           113
+  /v1/chat/completions                       9         1,760            44
   /v1/models                                 1             0             0
 ```
 
 Pass `--log-file` if the log is not at `proxy.jsonl`.
+
+### Reading the percentile table
+
+`SAMPLES` is not the request count — each row only counts the requests that
+could contribute to it. Token rows need the upstream to have reported usage, so
+rejected requests are absent rather than entering as zeros.
+
+`first token` covers streaming responses only. A non-streaming response does not
+send its head until generation has finished, so its time-to-first-byte is just
+its total latency; including those would blur the number rather than inform it.
+
+`per output token` is total latency divided by output tokens. It is the latency
+number that does not move with how much the model chose to write, which makes it
+the one worth comparing across days. For short completions it is dominated by
+prefill.

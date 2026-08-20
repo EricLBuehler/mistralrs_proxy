@@ -33,7 +33,7 @@ use axum::{
     body::Body,
     http::{
         Method, StatusCode, Uri, Version,
-        header::{CONTENT_LENGTH, HOST, USER_AGENT},
+        header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, USER_AGENT},
         request, response,
     },
 };
@@ -144,8 +144,14 @@ enum LogEvent {
     },
     ResponseStarted {
         id: Uuid,
-        at_unix_ms: u64,
         status: StatusCode,
+        streaming: bool,
+    },
+    /// Sent once, when the first body byte reaches the client. Separate from
+    /// `ResponseChunk` so the clock is read once per request, not per frame.
+    FirstResponseChunk {
+        id: Uuid,
+        at_unix_ms: u64,
     },
     ResponseChunk {
         id: Uuid,
@@ -162,6 +168,7 @@ struct Pending {
     started_at_unix_ms: u64,
     info: Box<RequestInfo>,
     status: Option<StatusCode>,
+    streaming: bool,
     first_byte_at_unix_ms: Option<u64>,
     response_bytes: u64,
     sniffer: UsageSniffer,
@@ -252,8 +259,8 @@ impl LogSender {
     pub fn response_started(&self, id: Uuid, parts: &response::Parts) {
         self.send(LogEvent::ResponseStarted {
             id,
-            at_unix_ms: now_unix_ms(),
             status: parts.status,
+            streaming: is_event_stream(&parts.headers),
         });
     }
 
@@ -315,6 +322,7 @@ struct CompletionGuard {
     logger: LogSender,
     id: Uuid,
     finished: bool,
+    saw_data: bool,
 }
 
 impl ObservedBody {
@@ -326,6 +334,7 @@ impl ObservedBody {
                 logger,
                 id,
                 finished: false,
+                saw_data: false,
             },
         };
 
@@ -350,6 +359,13 @@ impl HttpBody for ObservedBody {
         match this.inner.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(bytes) = frame.data_ref() {
+                    if !this.completion.saw_data {
+                        this.completion.saw_data = true;
+                        this.completion.logger.send(LogEvent::FirstResponseChunk {
+                            id: this.completion.id,
+                            at_unix_ms: now_unix_ms(),
+                        });
+                    }
                     this.completion.logger.send(LogEvent::ResponseChunk {
                         id: this.completion.id,
                         bytes: bytes.clone(),
@@ -482,6 +498,7 @@ fn handle_event(
                     started_at_unix_ms: at_unix_ms,
                     info,
                     status: None,
+                    streaming: false,
                     first_byte_at_unix_ms: None,
                     response_bytes: 0,
                     sniffer: UsageSniffer::new(),
@@ -491,11 +508,17 @@ fn handle_event(
         }
         LogEvent::ResponseStarted {
             id,
-            at_unix_ms,
             status,
+            streaming,
         } => {
             if let Some(entry) = pending.get_mut(&id) {
                 entry.status = Some(status);
+                entry.streaming = streaming;
+            }
+            Ok(false)
+        }
+        LogEvent::FirstResponseChunk { id, at_unix_ms } => {
+            if let Some(entry) = pending.get_mut(&id) {
                 entry.first_byte_at_unix_ms.get_or_insert(at_unix_ms);
             }
             Ok(false)
@@ -545,6 +568,7 @@ struct RequestRecord<'a> {
     key_sha256: Option<&'a str>,
     key_admin: Option<bool>,
     status: Option<u16>,
+    streaming: bool,
     response_bytes: u64,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -617,6 +641,7 @@ fn write_record(
         key_sha256: info.key_sha256.as_deref(),
         key_admin: info.identity.as_ref().map(|identity| identity.admin),
         status: entry.status.map(|status| status.as_u16()),
+        streaming: entry.streaming,
         response_bytes: entry.response_bytes,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -639,6 +664,20 @@ const fn version_string(version: Version) -> &'static str {
         Version::HTTP_3 => "HTTP/3.0",
         _ => "unknown",
     }
+}
+
+/// True when the response is a Server-Sent Events stream, which is how both
+/// the Chat Completions and Responses APIs stream.
+fn is_event_stream(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ` from Unix milliseconds.

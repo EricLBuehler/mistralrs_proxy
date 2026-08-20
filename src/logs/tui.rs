@@ -19,7 +19,9 @@ use ratatui::{
     widgets::{Block, Cell, Paragraph, Row, Table, TableState, Tabs},
 };
 
-use super::{LogRecord, Summary, Tail, duration, filter, summarize, thousands, truncate};
+use super::{
+    LogRecord, Summary, Tail, duration, filter, percentile_rows, summarize, thousands, truncate,
+};
 
 /// How often to look for newly appended records.
 const REFRESH: Duration = Duration::from_millis(400);
@@ -357,20 +359,21 @@ impl App {
                 )),
             ]),
             Line::from(vec![
-                label("latency  "),
+                label("shape    "),
                 Span::raw(format!(
-                    "p50 {}   p95 {}   max {}",
-                    duration(summary.median_ms),
-                    duration(summary.p95_ms),
-                    duration(summary.max_ms),
+                    "{} streaming   {} non-streaming",
+                    thousands(summary.streaming as u64),
+                    thousands(summary.non_streaming as u64),
                 )),
             ]),
         ];
 
-        let [overview_area, keys_area, paths_area] = Layout::vertical([
+        let rows = percentile_rows(summary);
+        let [overview_area, percentiles_area, keys_area, paths_area] = Layout::vertical([
             Constraint::Length(overview.len() as u16 + 1),
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
+            Constraint::Length(rows.len() as u16 + 2),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
         ])
         .areas(area);
 
@@ -378,6 +381,30 @@ impl App {
             Paragraph::new(overview),
             overview_area.inner(Margin::new(1, 0)),
         );
+
+        let percentiles = Table::new(
+            rows.into_iter().map(|(name, row)| {
+                Row::new(vec![
+                    Cell::from(name).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(row.p50),
+                    Cell::from(row.p95),
+                    Cell::from(row.max),
+                    Cell::from(row.samples).style(Style::default().fg(Color::DarkGray)),
+                ])
+            }),
+            [
+                Constraint::Length(20),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Min(9),
+            ],
+        )
+        .header(
+            Row::new(vec!["", "P50", "P95", "MAX", "SAMPLES"])
+                .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+        );
+        frame.render_widget(percentiles, percentiles_area.inner(Margin::new(1, 0)));
 
         let key_rows = summary.by_key.iter().map(|(name, totals)| {
             Row::new(vec![
@@ -561,11 +588,16 @@ fn detail_lines(record: &LogRecord) -> Vec<Line<'static>> {
         Line::from(vec![
             label("timing  "),
             Span::raw(format!(
-                "{} total   first byte {}   {} bytes out   {} bytes in",
+                "{} total   first byte {}   {}   {} bytes out   {} bytes in",
                 duration(record.duration_ms),
                 record
                     .time_to_first_byte_ms
                     .map_or_else(|| "-".to_owned(), duration),
+                if record.streaming {
+                    "streaming"
+                } else {
+                    "non-streaming"
+                },
                 thousands(record.response_bytes),
                 record
                     .request_content_length
@@ -625,7 +657,7 @@ mod tests {
 
     fn sample_app() -> App {
         app_with(concat!(
-            r#"{"request_id":"aaaaaaaa-0000-0000-0000-000000000001","started_at":"2026-08-20T10:00:00.000Z","started_at_unix_ms":1,"duration_ms":120,"method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"AAAAAAAA","key_sha256":"aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66","key_admin":true,"status":200,"authorized":true,"input_tokens":1234,"output_tokens":56,"response_bytes":900,"complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5000,"http_version":"HTTP/1.1","user_agent":"openai-python/1.2.3","time_to_first_byte_ms":40}"#,
+            r#"{"request_id":"aaaaaaaa-0000-0000-0000-000000000001","started_at":"2026-08-20T10:00:00.000Z","started_at_unix_ms":1,"duration_ms":120,"method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"AAAAAAAA","key_sha256":"aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66","key_admin":true,"status":200,"authorized":true,"streaming":true,"input_tokens":1234,"output_tokens":56,"response_bytes":900,"complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5000,"http_version":"HTTP/1.1","user_agent":"openai-python/1.2.3","time_to_first_byte_ms":40}"#,
             "\n",
             r#"{"request_id":"bbbbbbbb-0000-0000-0000-000000000002","started_at":"2026-08-20T10:00:05.000Z","started_at_unix_ms":2,"duration_ms":3000,"method":"GET","uri":"/v1/models","status":401,"authorized":false,"auth_error":"invalid_api_key","complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5001}"#,
             "\n",
@@ -651,6 +683,10 @@ mod tests {
         assert!(screen.contains("(unauthenticated)"), "{screen}");
         assert!(screen.contains("/v1/chat/completions"), "{screen}");
         assert!(screen.contains("2 requests"), "{screen}");
+        assert!(screen.contains("P50"), "{screen}");
+        assert!(screen.contains("first token"), "{screen}");
+        assert!(screen.contains("per output token"), "{screen}");
+        assert!(screen.contains("1 streaming"), "{screen}");
     }
 
     #[test]
@@ -682,6 +718,7 @@ mod tests {
 
         assert_eq!(app.selected, 1);
         assert!(screen.contains("openai-python/1.2.3"), "{screen}");
+        assert!(screen.contains("streaming"), "{screen}");
         assert!(screen.contains("1,234 in"), "{screen}");
     }
 
