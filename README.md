@@ -119,3 +119,55 @@ Chat Completions, ask for usage with `"stream_options": {"include_usage": true}`
 
 The log file is created `chmod 600`. Apply your own rotation. If the log cannot
 be written, the proxy stops serving traffic rather than serving it unrecorded.
+
+## Read the log
+
+```console
+mistralrs_proxy logs
+```
+
+Opens an explorer over the audit log. Safe to run while the proxy is serving —
+it only reads, and picks up new requests as they land.
+
+Two views, `tab` to switch:
+
+- **Summary** — request and status counts, total tokens, p50/p95/max latency,
+  and totals broken down by key and by endpoint.
+- **Requests** — every request, newest first, with the full record for whichever
+  one is selected.
+
+| Key | Action |
+| --- | --- |
+| `tab` | Switch view |
+| `↑` `↓` | Move |
+| `/` | Filter by key, endpoint, status, id… |
+| `e` | Show only errors and incomplete requests |
+| `r` | Refresh now |
+| `q` | Quit |
+
+For a one-shot summary with no TUI — handy over SSH or in a cron job:
+
+```console
+mistralrs_proxy logs --summary
+```
+
+```text
+proxy.jsonl
+13 requests from 2026-08-20T14:59:17.472Z to 2026-08-20T14:59:18.073Z
+
+  requests           13   authorized 11   rejected 2   incomplete 0
+  statuses   2xx 11   3xx 0   4xx 2   5xx 0   none 0
+  tokens            357 in   113 out   470 total
+  latency    p50 1ms   p95 163ms   max 163ms
+
+  KEY                       REQUESTS            IN           OUT   ERRORS
+  alice                            8           336           104        0
+  bot                              3            21             9        0
+  (unauthenticated)                2             0             0        2
+
+  ENDPOINT                            REQUESTS            IN           OUT
+  /v1/chat/completions                      11           357           113
+  /v1/models                                 1             0             0
+```
+
+Pass `--log-file` if the log is not at `proxy.jsonl`.
