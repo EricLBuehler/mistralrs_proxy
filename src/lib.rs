@@ -5,5 +5,6 @@ pub mod logging;
 pub mod logs;
 pub mod manage;
 pub mod proxy;
+pub mod register;
 pub mod runtime;
 pub mod usage;

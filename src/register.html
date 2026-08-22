@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en" data-registration-available="__REGISTRATION_AVAILABLE__">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#000000">
+    <meta name="referrer" content="no-referrer">
+    <title>mistral.rs key registration</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --background: #000000;
+        --surface: #090909;
+        --surface-raised: #101010;
+        --text: #f4f4f1;
+        --muted: #999995;
+        --quiet: #696966;
+        --border: #292929;
+        --border-strong: #4a4a48;
+        --button: #f4f4f1;
+        --button-text: #080808;
+        --danger: #ff9b9b;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        min-width: 280px;
+        min-height: 100%;
+        background: var(--background);
+      }
+
+      body {
+        min-height: 100vh;
+        min-height: 100svh;
+        margin: 0;
+        background: var(--background);
+        color: var(--text);
+        font-family: Arial, Helvetica, sans-serif;
+        font-size: 16px;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      button {
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      ::selection {
+        background: var(--text);
+        color: var(--background);
+      }
+
+      .shell {
+        width: min(calc(100% - 40px), 35rem);
+        margin: 0 auto;
+        padding: clamp(4.5rem, 13vh, 9rem) 0 3.5rem;
+      }
+
+      .rule {
+        width: 2.75rem;
+        height: 2px;
+        margin-bottom: 1.75rem;
+        background: var(--text);
+      }
+
+      h1,
+      h2,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 10em;
+        margin-bottom: 1rem;
+        font-size: clamp(2.25rem, 8vw, 3.75rem);
+        font-weight: 560;
+        line-height: 0.99;
+        letter-spacing: -0.052em;
+      }
+
+      .introduction {
+        max-width: 30rem;
+        margin-bottom: 0;
+        color: var(--muted);
+        font-size: 1.0625rem;
+        letter-spacing: -0.012em;
+      }
+
+      .registration,
+      .unavailable,
+      .result {
+        margin-top: clamp(3rem, 8vh, 4.75rem);
+        border-top: 1px solid var(--border);
+        padding-top: 2rem;
+      }
+
+      html[data-registration-available="true"] .unavailable,
+      html[data-registration-available="false"] .registration,
+      html[data-registration-available="false"] .available-introduction {
+        display: none;
+      }
+
+      .unavailable p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 1.0625rem;
+      }
+
+      .field {
+        display: grid;
+        gap: 0.625rem;
+      }
+
+      label,
+      .result-label {
+        color: var(--muted);
+        font-size: 0.8125rem;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      input {
+        width: 100%;
+        height: 3.625rem;
+        border: 1px solid var(--border);
+        border-radius: 0;
+        outline: 0;
+        background: var(--surface);
+        color: var(--text);
+        padding: 0 1rem;
+        caret-color: var(--text);
+        transition:
+          border-color 150ms ease,
+          background-color 150ms ease;
+      }
+
+      input:hover {
+        border-color: var(--border-strong);
+      }
+
+      input:focus-visible {
+        border-color: var(--text);
+        box-shadow: 0 0 0 1px var(--text);
+      }
+
+      input::placeholder {
+        color: var(--quiet);
+        opacity: 1;
+      }
+
+      input:disabled {
+        cursor: wait;
+        opacity: 0.68;
+      }
+
+      .primary-button,
+      .copy-button {
+        position: relative;
+        display: inline-flex;
+        min-height: 3.625rem;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid transparent;
+        border-radius: 0;
+        padding: 0.875rem 1.125rem;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+        cursor: pointer;
+        transition:
+          background-color 150ms ease,
+          color 150ms ease,
+          border-color 150ms ease,
+          transform 150ms ease;
+      }
+
+      .primary-button {
+        width: 100%;
+        margin-top: 1rem;
+        background: var(--button);
+        color: var(--button-text);
+      }
+
+      .primary-button:hover:not(:disabled) {
+        background: #dcdcd8;
+      }
+
+      .primary-button:active:not(:disabled),
+      .copy-button:active {
+        transform: translateY(1px);
+      }
+
+      .primary-button:disabled {
+        cursor: wait;
+        opacity: 0.72;
+      }
+
+      .primary-button:focus-visible,
+      .copy-button:focus-visible {
+        outline: 2px solid var(--text);
+        outline-offset: 3px;
+      }
+
+      .spinner {
+        display: none;
+        width: 1rem;
+        height: 1rem;
+        margin-left: 0.625rem;
+        border: 2px solid rgb(8 8 8 / 30%);
+        border-top-color: var(--button-text);
+        border-radius: 50%;
+        animation: spin 700ms linear infinite;
+      }
+
+      .primary-button[data-loading="true"] .spinner {
+        display: block;
+      }
+
+      .form-message,
+      .copy-status {
+        min-height: 1.5em;
+        margin: 0.875rem 0 0;
+        font-size: 0.875rem;
+      }
+
+      .form-message {
+        color: var(--danger);
+      }
+
+      .result {
+        animation: reveal 260ms ease-out both;
+      }
+
+      .result-label {
+        margin-bottom: 0.75rem;
+      }
+
+      h2 {
+        margin-bottom: 0.75rem;
+        font-size: clamp(1.65rem, 5vw, 2.25rem);
+        font-weight: 560;
+        line-height: 1.1;
+        letter-spacing: -0.035em;
+        outline: none;
+      }
+
+      .warning {
+        margin-bottom: 1.5rem;
+        color: var(--muted);
+      }
+
+      .warning strong {
+        color: var(--text);
+        font-weight: 600;
+      }
+
+      .key-panel {
+        border: 1px solid var(--border);
+        background: var(--surface);
+        padding: 1.125rem;
+      }
+
+      .key-panel code {
+        display: block;
+        color: var(--text);
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 0.875rem;
+        line-height: 1.65;
+        overflow-wrap: anywhere;
+        user-select: all;
+      }
+
+      .copy-button {
+        width: 100%;
+        margin-top: 0.75rem;
+        border-color: var(--border-strong);
+        background: var(--surface-raised);
+        color: var(--text);
+      }
+
+      .copy-button:hover {
+        border-color: var(--text);
+        background: #161616;
+      }
+
+      .copy-status {
+        color: var(--muted);
+      }
+
+      .fine-print {
+        margin: clamp(3.5rem, 9vh, 6.5rem) 0 0;
+        color: var(--quiet);
+        font-size: 0.75rem;
+        letter-spacing: 0.02em;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      @keyframes reveal {
+        from {
+          opacity: 0;
+          transform: translateY(8px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 420px) {
+        .shell {
+          width: min(calc(100% - 32px), 35rem);
+          padding-top: 3.5rem;
+        }
+
+        h1 {
+          font-size: 2.25rem;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <div class="rule" aria-hidden="true"></div>
+        <h1>mistral.rs key registration</h1>
+        <p class="introduction available-introduction">Enter your name to create a personal API key.</p>
+      </header>
+
+      <section class="registration" id="registration" aria-label="Register for an API key">
+        <form id="registration-form">
+          <div class="field">
+            <label for="name">Your name</label>
+            <input
+              id="name"
+              name="name"
+              type="text"
+              maxlength="64"
+              autocomplete="name"
+              autocapitalize="words"
+              placeholder="Enter your name"
+              aria-describedby="form-message"
+              required
+            >
+          </div>
+          <button class="primary-button" id="submit-button" type="submit">
+            <span id="submit-label">Create API key</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+          <p class="form-message" id="form-message" role="alert" hidden></p>
+        </form>
+      </section>
+
+      <section class="unavailable" aria-label="Registration unavailable">
+        <p>Key registration unavailable.</p>
+      </section>
+
+      <section class="result" id="result" aria-labelledby="result-heading" hidden>
+        <p class="result-label">Registration complete</p>
+        <h2 id="result-heading" tabindex="-1">Your API key</h2>
+        <p class="warning">
+          <strong>Copy this API key now.</strong> It won&rsquo;t be shown again.
+        </p>
+        <div class="key-panel">
+          <code id="api-key"></code>
+        </div>
+        <button class="copy-button" id="copy-button" type="button">Copy API key</button>
+        <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
+      </section>
+
+      <p class="fine-print">mistral.rs</p>
+    </main>
+
+    <script>
+      (() => {
+        "use strict";
+
+        const form = document.getElementById("registration-form");
+        const registration = document.getElementById("registration");
+        const nameInput = document.getElementById("name");
+        const submitButton = document.getElementById("submit-button");
+        const submitLabel = document.getElementById("submit-label");
+        const formMessage = document.getElementById("form-message");
+        const result = document.getElementById("result");
+        const resultHeading = document.getElementById("result-heading");
+        const apiKey = document.getElementById("api-key");
+        const copyButton = document.getElementById("copy-button");
+        const copyStatus = document.getElementById("copy-status");
+
+        const registrationUnavailable = "Key registration unavailable.";
+
+        const setLoading = (loading) => {
+          form.setAttribute("aria-busy", String(loading));
+          nameInput.disabled = loading;
+          submitButton.disabled = loading;
+          submitButton.dataset.loading = String(loading);
+          submitLabel.textContent = loading ? "Creating…" : "Create API key";
+        };
+
+        const showError = () => {
+          setLoading(false);
+          formMessage.textContent = registrationUnavailable;
+          formMessage.hidden = false;
+          nameInput.focus();
+        };
+
+        const showResult = (key) => {
+          apiKey.textContent = key;
+          registration.hidden = true;
+          result.hidden = false;
+          resultHeading.focus();
+        };
+
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+
+          const name = nameInput.value.trim();
+          if (!name) {
+            nameInput.setCustomValidity("Enter your name.");
+            nameInput.reportValidity();
+            nameInput.setCustomValidity("");
+            return;
+          }
+
+          formMessage.hidden = true;
+          formMessage.textContent = "";
+          setLoading(true);
+
+          try {
+            const response = await fetch("/register", {
+              method: "POST",
+              headers: {
+                Accept: "application/json",
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ name }),
+              cache: "no-store",
+              credentials: "same-origin",
+              redirect: "error",
+            });
+
+            if (!response.ok) {
+              showError();
+              return;
+            }
+
+            const payload = await response.json();
+            if (
+              payload === null ||
+              typeof payload !== "object" ||
+              typeof payload.api_key !== "string" ||
+              payload.api_key.length === 0
+            ) {
+              showError();
+              return;
+            }
+
+            showResult(payload.api_key);
+          } catch (_) {
+            showError();
+          }
+        });
+
+        const fallbackCopy = (text) => {
+          const temporary = document.createElement("textarea");
+          temporary.value = text;
+          temporary.setAttribute("readonly", "");
+          temporary.style.position = "fixed";
+          temporary.style.top = "0";
+          temporary.style.left = "-9999px";
+          temporary.style.opacity = "0";
+          document.body.appendChild(temporary);
+          temporary.focus();
+          temporary.select();
+          temporary.setSelectionRange(0, temporary.value.length);
+
+          let copied = false;
+          try {
+            copied = document.execCommand("copy");
+          } catch (_) {
+            copied = false;
+          }
+          temporary.remove();
+          return copied;
+        };
+
+        const selectVisibleKey = () => {
+          const selection = window.getSelection();
+          if (!selection) {
+            return;
+          }
+          const range = document.createRange();
+          range.selectNodeContents(apiKey);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        };
+
+        copyButton.addEventListener("click", async () => {
+          const key = apiKey.textContent;
+          let copied = false;
+
+          if (navigator.clipboard && window.isSecureContext) {
+            try {
+              await navigator.clipboard.writeText(key);
+              copied = true;
+            } catch (_) {
+              copied = false;
+            }
+          }
+
+          if (!copied) {
+            copied = fallbackCopy(key);
+            if (copied) {
+              copyButton.focus();
+            }
+          }
+
+          if (copied) {
+            copyButton.textContent = "Copied";
+            copyStatus.textContent = "API key copied to clipboard.";
+            return;
+          }
+
+          selectVisibleKey();
+          copyStatus.textContent = "Copy unavailable. The API key is selected for manual copying.";
+        });
+      })();
+    </script>
+  </body>
+</html>

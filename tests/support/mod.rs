@@ -3,7 +3,12 @@
 //! Shared harness: an in-process upstream, an in-process proxy, and helpers
 //! for building key stores and reading back the JSONL audit log.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{Router, body::Body, http::Uri};
 use hyper_util::{
@@ -12,10 +17,10 @@ use hyper_util::{
 };
 use mistralrs_proxy::{
     auth::KeyStore,
-    keys::KeyRecord,
+    keys::{KeyFile, KeyRecord, SCHEMA_VERSION},
     logging::{self, LogWorker},
     proxy,
-    runtime::{self, Backend, BackendList, RuntimeConfig},
+    runtime::{self, Backend, RegistrationConfig, RuntimeConfig, RuntimeState},
 };
 use serde_json::Value;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -38,6 +43,12 @@ pub struct TestKey {
 
 /// Build a key store from `(name, admin, disabled)` specs.
 pub fn key_store(specs: &[(&str, bool, bool)]) -> (KeyStore, Vec<TestKey>) {
+    let (records, issued) = key_records(specs);
+
+    (KeyStore::from_records(records).unwrap(), issued)
+}
+
+fn key_records(specs: &[(&str, bool, bool)]) -> (Vec<KeyRecord>, Vec<TestKey>) {
     let mut records = Vec::new();
     let mut issued = Vec::new();
     for (name, admin, disabled) in specs {
@@ -52,7 +63,7 @@ pub fn key_store(specs: &[(&str, bool, bool)]) -> (KeyStore, Vec<TestKey>) {
         records.push(record);
     }
 
-    (KeyStore::from_records(records).unwrap(), issued)
+    (records, issued)
 }
 
 /// A single enabled admin key named `alice`.
@@ -110,8 +121,9 @@ pub async fn unbound_addr() -> SocketAddr {
 
 pub struct Proxy {
     pub addr: SocketAddr,
-    backends: BackendList,
+    backends: RuntimeState,
     log_path: PathBuf,
+    keys_path: Option<PathBuf>,
     runtime_path: Option<PathBuf>,
     reload_task: Option<JoinHandle<()>>,
     shutdown: oneshot::Sender<()>,
@@ -122,27 +134,53 @@ pub struct Proxy {
 impl Proxy {
     pub async fn start(upstream: Uri, keys: KeyStore) -> Self {
         Self::start_with_backends(
-            BackendList::new(vec![Backend::new("test", upstream, true)]),
+            RuntimeState::new(vec![Backend::new("test", upstream, true)]),
             keys,
         )
         .await
     }
 
-    pub async fn start_with_backends(backends: BackendList, keys: KeyStore) -> Self {
-        Self::start_inner(backends, keys, None, None).await
+    pub async fn start_with_backends(backends: RuntimeState, keys: KeyStore) -> Self {
+        Self::start_inner(backends, keys, None, None, None).await
+    }
+
+    /// Start with a persistent key database so `/register` can issue keys.
+    /// Returns the proxy plus the plaintexts for the initial test records.
+    pub async fn start_file_backed(
+        upstream: Uri,
+        registration: RegistrationConfig,
+        specs: &[(&str, bool, bool)],
+    ) -> (Self, Vec<TestKey>) {
+        let path = std::env::temp_dir().join(format!("proxy-keys-{}.json", Uuid::new_v4()));
+        let (records, issued) = key_records(specs);
+        KeyFile {
+            version: SCHEMA_VERSION,
+            keys: records,
+        }
+        .save(&path)
+        .unwrap();
+        let keys = KeyStore::from_file(&path).unwrap();
+        let runtime = RuntimeState::from_config(RuntimeConfig {
+            backends: vec![Backend::new("test", upstream, true)],
+            registration,
+        });
+        let proxy = Self::start_inner(runtime, keys, Some(path), None, None).await;
+
+        (proxy, issued)
     }
 
     pub async fn start_with_runtime(runtime_path: PathBuf, keys: KeyStore) -> Self {
         let config = RuntimeConfig::load(&runtime_path).await.unwrap();
-        let backends = BackendList::from_config(config);
+        let backends = RuntimeState::from_config(config);
         let reload_task = tokio::spawn(runtime::reload(runtime_path.clone(), backends.clone()));
 
-        Self::start_inner(backends, keys, Some(runtime_path), Some(reload_task)).await
+        Self::start_inner(backends, keys, None, Some(runtime_path), Some(reload_task)).await
     }
 
     async fn start_inner(
-        backends: BackendList,
+        backends: RuntimeState,
         keys: KeyStore,
+        keys_path: Option<PathBuf>,
         runtime_path: Option<PathBuf>,
         reload_task: Option<JoinHandle<()>>,
     ) -> Self {
@@ -173,6 +211,7 @@ impl Proxy {
             addr,
             backends,
             log_path,
+            keys_path,
             runtime_path,
             reload_task,
             shutdown,
@@ -189,6 +228,16 @@ impl Proxy {
         self.backends.configured()
     }
 
+    pub fn registration_config(&self) -> RegistrationConfig {
+        self.backends.registration()
+    }
+
+    pub fn keys_path(&self) -> &Path {
+        self.keys_path
+            .as_deref()
+            .expect("this proxy does not have a file-backed key store")
+    }
+
     /// Shut the proxy down and return the audit records it wrote.
     pub async fn stop(self) -> Vec<Value> {
         stop(self.shutdown, self.task).await;
@@ -200,6 +249,9 @@ impl Proxy {
 
         let log = std::fs::read_to_string(&self.log_path).unwrap();
         std::fs::remove_file(&self.log_path).unwrap();
+        if let Some(keys_path) = self.keys_path {
+            std::fs::remove_file(keys_path).unwrap();
+        }
         if let Some(runtime_path) = self.runtime_path {
             std::fs::remove_file(runtime_path).unwrap();
         }

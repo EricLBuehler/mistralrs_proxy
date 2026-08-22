@@ -2,3 +2,7 @@
 id = "gh200-a"
 url = "http://127.0.0.1:18001"
 enabled = true
+
+[registration]
+enabled = true
+# Omit max_keys to allow unlimited registrations.

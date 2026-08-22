@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::{
         self, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
         header::{
@@ -13,6 +13,7 @@ use axum::{
         request,
     },
     response::{IntoResponse, Response},
+    routing::get,
 };
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use serde_json::json;
@@ -21,7 +22,7 @@ use uuid::Uuid;
 use crate::{
     auth::{AuthError, KeyStore, authenticate},
     logging::{LogSender, RequestInfo},
-    runtime::BackendList,
+    runtime::RuntimeState,
 };
 
 pub type HttpClient = Client<HttpConnector, Body>;
@@ -30,21 +31,21 @@ const IDENTITY: HeaderValue = HeaderValue::from_static("identity");
 
 pub struct AppState {
     client: HttpClient,
-    backends: BackendList,
+    pub(crate) runtime: RuntimeState,
     logger: LogSender,
-    keys: KeyStore,
+    pub(crate) keys: KeyStore,
 }
 
 impl AppState {
     pub fn new(
         client: HttpClient,
-        backends: BackendList,
+        runtime: RuntimeState,
         logger: LogSender,
         keys: KeyStore,
     ) -> Self {
         Self {
             client,
-            backends,
+            runtime,
             logger,
             keys,
         }
@@ -52,7 +53,15 @@ impl AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new().fallback(proxy).with_state(state)
+    let register = get(crate::register::page)
+        .post(crate::register::create)
+        .layer(DefaultBodyLimit::max(crate::register::BODY_LIMIT));
+
+    Router::new()
+        .route("/register", register.clone())
+        .route("/register/", register)
+        .fallback(proxy)
+        .with_state(state)
 }
 
 /// Authenticate, forward, and log. Every response leaves through
@@ -96,7 +105,7 @@ async fn forward(
     mut parts: request::Parts,
     body: Body,
 ) -> Response {
-    let Some(backend) = state.backends.available() else {
+    let Some(backend) = state.runtime.available() else {
         return service_unavailable();
     };
 

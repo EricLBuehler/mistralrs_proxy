@@ -29,14 +29,27 @@ impl Backend {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub backends: Vec<Backend>,
+    pub registration: RegistrationConfig,
+}
+
+/// Runtime controls for the public API-key registration page.
+///
+/// Registration is deliberately disabled unless the runtime file opts in.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RegistrationConfig {
+    pub enabled: bool,
+    pub max_keys: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RuntimeFile {
     backends: Vec<BackendFile>,
+    #[serde(default)]
+    registration: RegistrationConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,7 +94,10 @@ impl RuntimeConfig {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Self { backends })
+        Ok(Self {
+            backends,
+            registration: file.registration,
+        })
     }
 }
 
@@ -150,51 +166,67 @@ fn parse_backend_url(value: &str) -> Result<Uri, String> {
     Ok(uri)
 }
 
-/// The configured backend vector shared by request handlers and the reloader.
-/// Reads only hold the lock long enough to clone one backend, never across I/O.
+/// The current valid runtime configuration shared by handlers and the reloader.
+/// Reads only hold the lock long enough to clone the requested value, never
+/// across I/O.
 #[derive(Clone, Debug)]
-pub struct BackendList {
-    inner: Arc<RwLock<Vec<Backend>>>,
+pub struct RuntimeState {
+    inner: Arc<RwLock<RuntimeConfig>>,
 }
 
-impl BackendList {
+impl RuntimeState {
     pub fn new(backends: Vec<Backend>) -> Self {
+        Self::from_config(RuntimeConfig {
+            backends,
+            registration: RegistrationConfig::default(),
+        })
+    }
+
+    pub fn from_config(config: RuntimeConfig) -> Self {
         assert_eq!(
-            backends.len(),
+            config.backends.len(),
             1,
             "the proxy currently supports exactly one backend"
         );
         Self {
-            inner: Arc::new(RwLock::new(backends)),
+            inner: Arc::new(RwLock::new(config)),
         }
-    }
-
-    pub fn from_config(config: RuntimeConfig) -> Self {
-        Self::new(config.backends)
     }
 
     pub fn available(&self) -> Option<Backend> {
         self.inner
             .read()
-            .expect("backend list lock poisoned")
+            .expect("runtime state lock poisoned")
+            .backends
             .iter()
             .find(|backend| backend.enabled)
             .cloned()
     }
 
     pub fn configured(&self) -> Backend {
-        self.inner.read().expect("backend list lock poisoned")[0].clone()
+        self.inner
+            .read()
+            .expect("runtime state lock poisoned")
+            .backends[0]
+            .clone()
+    }
+
+    pub fn registration(&self) -> RegistrationConfig {
+        self.inner
+            .read()
+            .expect("runtime state lock poisoned")
+            .registration
     }
 
     fn replace(&self, config: RuntimeConfig) {
         debug_assert_eq!(config.backends.len(), 1);
-        *self.inner.write().expect("backend list lock poisoned") = config.backends;
+        *self.inner.write().expect("runtime state lock poisoned") = config;
     }
 }
 
 /// Re-read `path` every 500 ms, atomically publishing each valid configuration.
-/// Invalid transient contents leave the last known-good backend in place.
-pub async fn reload(path: PathBuf, backends: BackendList) {
+/// Invalid transient contents leave the entire last known-good state in place.
+pub async fn reload(path: PathBuf, runtime: RuntimeState) {
     let mut interval = tokio::time::interval(RELOAD_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // `interval`'s first tick is immediate; startup already performed that load.
@@ -205,7 +237,7 @@ pub async fn reload(path: PathBuf, backends: BackendList) {
         interval.tick().await;
         match RuntimeConfig::load(&path).await {
             Ok(config) => {
-                backends.replace(config);
+                runtime.replace(config);
                 if last_error.take().is_some() {
                     eprintln!("runtime config at {} is valid again", path.display());
                 }
@@ -214,7 +246,7 @@ pub async fn reload(path: PathBuf, backends: BackendList) {
                 let message = error.to_string();
                 if last_error.as_deref() != Some(message.as_str()) {
                     eprintln!(
-                        "could not reload runtime config; keeping the last valid backend: {message}"
+                        "could not reload runtime config; keeping the last valid state: {message}"
                     );
                 }
                 last_error = Some(message);
@@ -246,14 +278,57 @@ enabled = true
                 true,
             )]
         );
+        assert_eq!(config.registration, RegistrationConfig::default());
+    }
+
+    #[test]
+    fn registration_is_disabled_and_unlimited_when_omitted() {
+        let config = RuntimeConfig::parse(ENABLED_BACKEND).unwrap();
+
+        assert!(!config.registration.enabled);
+        assert_eq!(config.registration.max_keys, None);
+    }
+
+    #[test]
+    fn parses_registration_controls() {
+        let config = RuntimeConfig::parse(&format!(
+            "{ENABLED_BACKEND}\n[registration]\nenabled = true\nmax_keys = 25\n"
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.registration,
+            RegistrationConfig {
+                enabled: true,
+                max_keys: Some(25),
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_registration_section_keeps_safe_defaults() {
+        let config = RuntimeConfig::parse(&format!("{ENABLED_BACKEND}\n[registration]\n")).unwrap();
+
+        assert_eq!(config.registration, RegistrationConfig::default());
+    }
+
+    #[test]
+    fn omitted_max_keys_means_unlimited_even_when_registration_is_enabled() {
+        let config = RuntimeConfig::parse(&format!(
+            "{ENABLED_BACKEND}\n[registration]\nenabled = true\n"
+        ))
+        .unwrap();
+
+        assert!(config.registration.enabled);
+        assert_eq!(config.registration.max_keys, None);
     }
 
     #[test]
     fn a_disabled_backend_is_not_available() {
         let config = RuntimeConfig::parse(&ENABLED_BACKEND.replace("true", "false")).unwrap();
-        let backends = BackendList::from_config(config);
+        let runtime = RuntimeState::from_config(config);
 
-        assert!(backends.available().is_none());
+        assert!(runtime.available().is_none());
     }
 
     #[test]

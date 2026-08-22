@@ -10,7 +10,7 @@ use mistralrs_proxy::{
     auth::KeyStore,
     config::{Cli, Command, KeyCommand, ServeArgs},
     logging, logs, manage, proxy,
-    runtime::{self, BackendList, RuntimeConfig},
+    runtime::{self, RuntimeConfig, RuntimeState},
 };
 
 fn main() -> ExitCode {
@@ -55,8 +55,8 @@ fn load_keys(path: &Path) -> Result<KeyStore, Box<dyn Error>> {
 
 async fn run(args: ServeArgs, keys: KeyStore) -> Result<(), Box<dyn Error>> {
     let runtime_config = RuntimeConfig::load(&args.runtime_file).await?;
-    let backends = BackendList::from_config(runtime_config);
-    let initial_backend = backends.configured();
+    let runtime = RuntimeState::from_config(runtime_config);
+    let initial_backend = runtime.configured();
 
     let listener = tokio::net::TcpListener::bind(args.listen_addr).await?;
     let local_addr = listener.local_addr()?;
@@ -74,11 +74,11 @@ async fn run(args: ServeArgs, keys: KeyStore) -> Result<(), Box<dyn Error>> {
     let key_count = keys.len();
     let app = proxy::router(Arc::new(proxy::AppState::new(
         client,
-        backends.clone(),
+        runtime.clone(),
         logger,
         keys,
     )));
-    let reload_task = tokio::spawn(runtime::reload(args.runtime_file.clone(), backends));
+    let reload_task = tokio::spawn(runtime::reload(args.runtime_file.clone(), runtime));
 
     eprintln!(
         "proxy listening on http://{local_addr}, runtime config {}, backend {} at {} is {}, {key_count} key{} loaded",

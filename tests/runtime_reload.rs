@@ -10,7 +10,7 @@ use axum::{
     response::Response,
 };
 use http_body_util::BodyExt;
-use mistralrs_proxy::runtime::{Backend, BackendList, RELOAD_INTERVAL};
+use mistralrs_proxy::runtime::{Backend, RELOAD_INTERVAL, RegistrationConfig, RuntimeState};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -42,6 +42,22 @@ fn runtime_toml(id: &str, url: &axum::http::Uri, enabled: bool) -> String {
     format!("[[backends]]\nid = {id:?}\nurl = \"{url}\"\nenabled = {enabled}\n")
 }
 
+fn runtime_toml_with_registration(
+    id: &str,
+    url: &axum::http::Uri,
+    registration: &RegistrationConfig,
+) -> String {
+    let max_keys = registration
+        .max_keys
+        .map(|limit| format!("max_keys = {limit}\n"))
+        .unwrap_or_default();
+    format!(
+        "{}\n[registration]\nenabled = {}\n{max_keys}",
+        runtime_toml(id, url, true),
+        registration.enabled,
+    )
+}
+
 async fn observed_upstream(State(observed): State<mpsc::UnboundedSender<()>>) -> &'static str {
     observed.send(()).unwrap();
     "unexpected"
@@ -56,7 +72,7 @@ async fn a_disabled_backend_returns_a_logged_503_without_contacting_upstream() {
             .with_state(observed_tx),
     )
     .await;
-    let backends = BackendList::new(vec![Backend::new("disabled", upstream.uri(""), false)]);
+    let backends = RuntimeState::new(vec![Backend::new("disabled", upstream.uri(""), false)]);
     let (keys, key) = one_key();
     let proxy = Proxy::start_with_backends(backends, keys).await;
 
@@ -153,4 +169,46 @@ async fn reload_switches_the_live_backend_after_the_500ms_interval() {
     proxy.stop().await;
     first.stop().await;
     second.stop().await;
+}
+
+#[tokio::test]
+async fn reload_updates_the_live_registration_controls() {
+    let upstream =
+        Upstream::start(Router::new().fallback(named_upstream).with_state("ready")).await;
+    let runtime_path = temp_runtime_path();
+    std::fs::write(
+        &runtime_path,
+        runtime_toml("backend", &upstream.uri(""), true),
+    )
+    .unwrap();
+
+    let (keys, _) = one_key();
+    let proxy = Proxy::start_with_runtime(runtime_path.clone(), keys).await;
+    assert_eq!(proxy.registration_config(), RegistrationConfig::default());
+
+    // Let the immediate tick pass so this exercises the periodic reload.
+    tokio::task::yield_now().await;
+    let reloaded = RegistrationConfig {
+        enabled: true,
+        max_keys: Some(12),
+    };
+    std::fs::write(
+        &runtime_path,
+        runtime_toml_with_registration("backend", &upstream.uri(""), &reloaded),
+    )
+    .unwrap();
+
+    tokio::time::timeout(RELOAD_INTERVAL + Duration::from_secs(1), async {
+        loop {
+            if proxy.registration_config() == reloaded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("registration config was not reloaded after the 500 ms interval");
+
+    proxy.stop().await;
+    upstream.stop().await;
 }

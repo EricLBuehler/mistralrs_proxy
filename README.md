@@ -34,6 +34,11 @@ Configure the backend in `runtime.toml`:
 id = "gh200-a"
 url = "http://127.0.0.1:1234"
 enabled = true
+
+[registration]
+enabled = true
+# Omit max_keys for unlimited registrations.
+# max_keys = 100
 ```
 
 ```console
@@ -52,17 +57,34 @@ Options (each also settable by environment variable):
 | `--quiet` | `QUIET` | off |
 
 Exactly one backend must be present for now, and its URL must be plain
-`http://`. The file is reloaded every 500 ms, so URL and `enabled` changes take
-effect without restarting. Set `enabled = false` to take the backend out of
-service; requests then receive a `503 service_unavailable` response with
-`Retry-After: 1`. The same generic response is returned if the configured
-backend cannot be reached, without exposing the proxy topology to clients; the
-connection detail is recorded only in the JSONL audit log. If a reload finds a
-missing or malformed file, the proxy keeps the last valid configuration. Run
-`mistralrs_proxy serve --help` for the full option list.
+`http://`. The file is reloaded every 500 ms, so backend and registration
+changes take effect without restarting. Registration is disabled when the
+`[registration]` section is omitted. Set `enabled = true` to expose the local
+key-registration page, and optionally set `max_keys` to stop issuing keys once
+the key database reaches that size; omit `max_keys` for no configured limit.
 
-Keys are read once at startup. After creating, changing, or deleting a key,
-restart the proxy.
+Set the backend's `enabled = false` to take it out of service; requests then
+receive a `503 service_unavailable` response with `Retry-After: 1`. The same
+generic response is returned if the configured backend cannot be reached,
+without exposing the proxy topology to clients; the connection detail is
+recorded only in the JSONL audit log. If a reload finds a missing or malformed
+file, the proxy keeps the last valid configuration. Run `mistralrs_proxy serve
+--help` for the full option list.
+
+Keys issued by the registration page are persisted and become usable
+immediately. Changes made with the CLI key manager still require a restart;
+do not run the key manager while the server is accepting registrations.
+
+## Register a key
+
+Open `http://127.0.0.1:3000/register`, enter your name, and copy the API key
+when it appears. The plaintext is shown only once and is never written to the
+key database or audit log. Keys created here are active non-admin keys.
+
+Registration is intentionally unauthenticated: anyone who can reach this page
+can create a key until `max_keys` is reached. Use a trusted network or put the
+proxy behind TLS and appropriate network access controls when exposing it
+beyond localhost.
 
 ## Call it
 
