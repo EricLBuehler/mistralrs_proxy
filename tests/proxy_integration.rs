@@ -316,7 +316,7 @@ async fn a_missing_authorization_header_is_logged_without_a_digest() {
 }
 
 #[tokio::test]
-async fn upstream_connection_failure_is_a_logged_bad_gateway() {
+async fn backend_connection_failure_is_a_logged_service_unavailable() {
     let (keys, key) = one_key();
     let unreachable = format!("http://{}", unbound_addr().await);
     let proxy = Proxy::start(unreachable.parse().unwrap(), keys).await;
@@ -329,22 +329,34 @@ async fn upstream_connection_failure_is_a_logged_bad_gateway() {
         .body(Body::from("hello"))
         .unwrap();
     let response = client.request(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     let id = request_id(&response);
     let error: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(error["error"]["code"], "upstream_connection_error");
+    assert_eq!(error["error"]["type"], "api_error");
+    assert_eq!(error["error"]["code"], "service_unavailable");
+    assert_eq!(
+        error["error"]["message"],
+        "The service is temporarily unavailable. Please retry shortly."
+    );
 
     drop(client);
     let records = proxy.stop().await;
 
     let record = record_for(&records, &id);
-    assert_eq!(record["status"], 502);
+    assert_eq!(record["status"], 503);
     assert_eq!(record["authorized"], true);
     assert_eq!(record["key_name"], "alice");
     assert_eq!(record["complete"], true);
     assert_eq!(record["input_tokens"], Value::Null);
     assert_eq!(record["output_tokens"], Value::Null);
+    assert!(
+        record["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("backend request failed:")
+    );
 }
 
 #[tokio::test]

@@ -147,6 +147,10 @@ enum LogEvent {
         status: StatusCode,
         streaming: bool,
     },
+    RequestError {
+        id: Uuid,
+        error: String,
+    },
     /// Sent once, when the first body byte reaches the client. Separate from
     /// `ResponseChunk` so the clock is read once per request, not per frame.
     FirstResponseChunk {
@@ -172,6 +176,7 @@ struct Pending {
     first_byte_at_unix_ms: Option<u64>,
     response_bytes: u64,
     sniffer: UsageSniffer,
+    error: Option<String>,
 }
 
 /// Open the JSONL sink and spawn the writer thread.
@@ -261,6 +266,14 @@ impl LogSender {
             id,
             status: parts.status,
             streaming: is_event_stream(&parts.headers),
+        });
+    }
+
+    /// Attach an internal failure detail to the server-side audit record.
+    pub fn request_error(&self, id: Uuid, error: impl Into<String>) {
+        self.send(LogEvent::RequestError {
+            id,
+            error: error.into(),
         });
     }
 
@@ -502,6 +515,7 @@ fn handle_event(
                     first_byte_at_unix_ms: None,
                     response_bytes: 0,
                     sniffer: UsageSniffer::new(),
+                    error: None,
                 },
             );
             Ok(false)
@@ -514,6 +528,12 @@ fn handle_event(
             if let Some(entry) = pending.get_mut(&id) {
                 entry.status = Some(status);
                 entry.streaming = streaming;
+            }
+            Ok(false)
+        }
+        LogEvent::RequestError { id, error } => {
+            if let Some(entry) = pending.get_mut(&id) {
+                entry.error = Some(error);
             }
             Ok(false)
         }
@@ -586,7 +606,8 @@ fn write_record(
     outcome: BodyOutcome,
     terminal_log: bool,
 ) -> io::Result<()> {
-    let (complete, termination, error) = outcome.describe();
+    let (complete, termination, outcome_error) = outcome.describe();
+    let error = entry.error.as_deref().or(outcome_error);
     let usage = entry.sniffer.usage().unwrap_or_default();
     let duration_ms = finished_at_unix_ms.saturating_sub(entry.started_at_unix_ms);
     let info = &entry.info;

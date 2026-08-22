@@ -66,14 +66,15 @@ async fn a_disabled_backend_returns_a_logged_503_without_contacting_upstream() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     let id = request_id(&response);
     let error: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(error["error"]["type"], "api_error");
-    assert_eq!(error["error"]["code"], "backend_unavailable");
+    assert_eq!(error["error"]["code"], "service_unavailable");
     assert_eq!(
         error["error"]["message"],
-        "No enabled backend is currently available."
+        "The service is temporarily unavailable. Please retry shortly."
     );
 
     assert!(

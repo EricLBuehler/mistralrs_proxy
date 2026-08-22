@@ -7,8 +7,8 @@ use axum::{
     http::{
         self, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
         header::{
-            ACCEPT_ENCODING, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
-            TRAILER, TRANSFER_ENCODING, UPGRADE, WWW_AUTHENTICATE,
+            ACCEPT_ENCODING, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION,
+            RETRY_AFTER, TE, TRAILER, TRANSFER_ENCODING, UPGRADE, WWW_AUTHENTICATE,
         },
         request,
     },
@@ -82,7 +82,7 @@ async fn proxy(
         .request_started(request_id, RequestInfo::new(peer, &parts, &authentication));
 
     let response = match authentication.result {
-        Ok(()) => forward(&state, parts, body).await,
+        Ok(()) => forward(&state, request_id, parts, body).await,
         Err(error) => authentication_error(error),
     };
 
@@ -90,14 +90,14 @@ async fn proxy(
     finish(&state.logger, request_id, response)
 }
 
-async fn forward(state: &AppState, mut parts: request::Parts, body: Body) -> Response {
+async fn forward(
+    state: &AppState,
+    request_id: Uuid,
+    mut parts: request::Parts,
+    body: Body,
+) -> Response {
     let Some(backend) = state.backends.available() else {
-        return json_error_body(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "api_error",
-            "backend_unavailable",
-            "No enabled backend is currently available.",
-        );
+        return service_unavailable();
     };
 
     parts.uri = match upstream_uri(&backend.url, &parts.uri) {
@@ -122,12 +122,10 @@ async fn forward(state: &AppState, mut parts: request::Parts, body: Body) -> Res
     let upstream_response = match state.client.request(Request::from_parts(parts, body)).await {
         Ok(response) => response,
         Err(error) => {
-            return json_error_body(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "upstream_connection_error",
-                &format!("Could not reach the upstream API: {error}"),
-            );
+            state
+                .logger
+                .request_error(request_id, format!("backend request failed: {error}"));
+            return service_unavailable();
         }
     };
 
@@ -136,6 +134,19 @@ async fn forward(state: &AppState, mut parts: request::Parts, body: Body) -> Res
     remove_hop_by_hop_headers(&mut parts.headers);
 
     Response::from_parts(parts, Body::new(body))
+}
+
+fn service_unavailable() -> Response {
+    let mut response = json_error_body(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "api_error",
+        "service_unavailable",
+        "The service is temporarily unavailable. Please retry shortly.",
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 fn authentication_error(error: AuthError) -> Response {

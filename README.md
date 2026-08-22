@@ -54,9 +54,12 @@ Options (each also settable by environment variable):
 Exactly one backend must be present for now, and its URL must be plain
 `http://`. The file is reloaded every 500 ms, so URL and `enabled` changes take
 effect without restarting. Set `enabled = false` to take the backend out of
-service; requests then receive a `503 backend_unavailable` response. If a
-reload finds a missing or malformed file, the proxy keeps the last valid
-configuration. Run `mistralrs_proxy serve --help` for the full option list.
+service; requests then receive a `503 service_unavailable` response with
+`Retry-After: 1`. The same generic response is returned if the configured
+backend cannot be reached, without exposing the proxy topology to clients; the
+connection detail is recorded only in the JSONL audit log. If a reload finds a
+missing or malformed file, the proxy keeps the last valid configuration. Run
+`mistralrs_proxy serve --help` for the full option list.
 
 Keys are read once at startup. After creating, changing, or deleting a key,
 restart the proxy.
