@@ -417,6 +417,7 @@
         const copyStatus = document.getElementById("copy-status");
 
         const registrationUnavailable = "Key registration unavailable.";
+        const duplicateName = "That name is already registered.";
 
         const setLoading = (loading) => {
           form.setAttribute("aria-busy", String(loading));
@@ -426,9 +427,9 @@
           submitLabel.textContent = loading ? "Creating…" : "Create API key";
         };
 
-        const showError = () => {
+        const showError = (message = registrationUnavailable) => {
           setLoading(false);
-          formMessage.textContent = registrationUnavailable;
+          formMessage.textContent = message;
           formMessage.hidden = false;
           nameInput.focus();
         };
@@ -469,7 +470,7 @@
             });
 
             if (!response.ok) {
-              showError();
+              showError(response.status === 409 ? duplicateName : registrationUnavailable);
               return;
             }
 

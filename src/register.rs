@@ -19,6 +19,7 @@ pub const BODY_LIMIT: usize = 1_024;
 const PAGE: &str = include_str!("register.html");
 const AVAILABILITY_PLACEHOLDER: &str = "__REGISTRATION_AVAILABLE__";
 const UNAVAILABLE_MESSAGE: &str = "Key registration unavailable.";
+const DUPLICATE_NAME_MESSAGE: &str = "That name is already registered.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,11 +72,28 @@ pub async fn create(
                 .into_response(),
         ),
         Err(KeyCreationError::InvalidName(_)) => unavailable(StatusCode::BAD_REQUEST),
-        Err(KeyCreationError::DuplicateName) => unavailable(StatusCode::CONFLICT),
+        Err(KeyCreationError::DuplicateName) => duplicate_name(),
         Err(KeyCreationError::LimitReached | KeyCreationError::Unavailable(_)) => {
             unavailable(StatusCode::SERVICE_UNAVAILABLE)
         }
     }
+}
+
+fn duplicate_name() -> Response {
+    secure_response(
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": {
+                    "message": DUPLICATE_NAME_MESSAGE,
+                    "type": "invalid_request_error",
+                    "param": "name",
+                    "code": "name_already_registered"
+                }
+            })),
+        )
+            .into_response(),
+    )
 }
 
 fn is_cross_site(headers: &HeaderMap) -> bool {
@@ -147,6 +165,7 @@ mod tests {
             "Create API key",
             "It won&rsquo;t be shown again.",
             "Key registration unavailable.",
+            "That name is already registered.",
         ] {
             assert!(PAGE.contains(required), "page is missing {required:?}");
         }
