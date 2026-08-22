@@ -37,12 +37,12 @@ policy = "least-pressure-v1"
 kv_soft_limit = 0.85
 
 [telemetry]
-scrape_interval_ms = 1000
+scrape_interval_ms = 2000
 scrape_timeout_ms = 750
-stale_after_ms = 5000
+stale_after_ms = 10000
 
 [readiness]
-probe_interval_ms = 2000
+probe_interval_ms = 5000
 probe_timeout_ms = 1000
 success_threshold = 2
 failure_threshold = 3
