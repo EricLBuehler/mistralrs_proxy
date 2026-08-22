@@ -10,10 +10,13 @@ pub mod tui;
 
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use serde::Deserialize;
 
@@ -44,6 +47,18 @@ pub struct LogRecord {
     pub key_identifier: Option<String>,
     pub key_sha256: Option<String>,
     pub key_admin: Option<bool>,
+    pub backend_id: Option<String>,
+    pub routing_policy: Option<String>,
+    pub routing_reason: Option<String>,
+    pub eligible_backend_count: Option<usize>,
+    pub backend_pressure_at_dispatch: Option<f64>,
+    pub backend_running_at_dispatch: Option<u64>,
+    pub backend_waiting_at_dispatch: Option<u64>,
+    pub backend_capacity_at_dispatch: Option<u64>,
+    pub backend_kv_pressure_at_dispatch: Option<f64>,
+    pub backend_metrics_age_ms: Option<u64>,
+    pub backend_proxy_active_at_dispatch: Option<usize>,
+    pub proxy_queue_ms: Option<u64>,
     pub status: Option<u16>,
     pub streaming: bool,
     pub response_bytes: u64,
@@ -95,6 +110,8 @@ impl LogRecord {
             self.key_name.as_deref().unwrap_or(""),
             self.key_identifier.as_deref().unwrap_or(""),
             self.auth_error.as_deref().unwrap_or(""),
+            self.backend_id.as_deref().unwrap_or(""),
+            self.routing_reason.as_deref().unwrap_or(""),
             self.started_at.as_str(),
         ];
         if fields
@@ -145,6 +162,24 @@ impl Tail {
     /// explorer can be opened before the proxy has served its first request.
     pub fn poll(&mut self) -> io::Result<Appended> {
         let mut restarted = false;
+        #[cfg(unix)]
+        if let Some(open) = self.file.as_ref() {
+            match fs::metadata(&self.path) {
+                Ok(path_metadata) => {
+                    let open_metadata = open.metadata()?;
+                    if path_metadata.dev() != open_metadata.dev()
+                        || path_metadata.ino() != open_metadata.ino()
+                    {
+                        self.file = Some(File::open(&self.path)?);
+                        self.offset = 0;
+                        self.partial.clear();
+                        restarted = true;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
         if self.file.is_none() {
             match File::open(&self.path) {
                 Ok(file) => {
@@ -217,6 +252,43 @@ pub struct PathTotals {
     pub output_tokens: u64,
 }
 
+/// Historical totals and latency distributions for one selected backend.
+#[derive(Clone, Debug, Default)]
+pub struct BackendTotals {
+    pub requests: usize,
+    pub errors: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub queue_ms: Distribution,
+    pub first_byte_ms: Distribution,
+    pub latency_ms: Distribution,
+}
+
+#[derive(Default)]
+struct BackendAccumulator {
+    requests: usize,
+    errors: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    queues: Vec<u64>,
+    first_bytes: Vec<u64>,
+    latencies: Vec<u64>,
+}
+
+impl BackendAccumulator {
+    fn finish(self) -> BackendTotals {
+        BackendTotals {
+            requests: self.requests,
+            errors: self.errors,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            queue_ms: Distribution::from_values(self.queues),
+            first_byte_ms: Distribution::from_values(self.first_bytes),
+            latency_ms: Distribution::from_values(self.latencies),
+        }
+    }
+}
+
 /// Nearest-rank p50/p95/max over one sample set.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Distribution {
@@ -279,6 +351,8 @@ pub struct Summary {
     pub by_key: Vec<(String, KeyTotals)>,
     /// Sorted by request count, descending.
     pub by_path: Vec<(String, PathTotals)>,
+    /// Routed requests sorted by backend request count, descending.
+    pub by_backend: Vec<(String, BackendTotals)>,
 }
 
 pub fn summarize(records: &[LogRecord]) -> Summary {
@@ -288,6 +362,7 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
     };
     let mut keys: HashMap<&str, KeyTotals> = HashMap::new();
     let mut paths: HashMap<&str, PathTotals> = HashMap::new();
+    let mut backends: HashMap<&str, BackendAccumulator> = HashMap::new();
     let mut latencies = Vec::with_capacity(records.len());
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
@@ -351,6 +426,21 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
         path.errors += usize::from(record.is_error());
         path.input_tokens = path.input_tokens.saturating_add(input);
         path.output_tokens = path.output_tokens.saturating_add(output);
+
+        if let Some(backend_id) = record.backend_id.as_deref() {
+            let backend = backends.entry(backend_id).or_default();
+            backend.requests += 1;
+            backend.errors += usize::from(record.is_error());
+            backend.input_tokens = backend.input_tokens.saturating_add(input);
+            backend.output_tokens = backend.output_tokens.saturating_add(output);
+            backend.latencies.push(record.duration_ms);
+            if let Some(ms) = record.proxy_queue_ms {
+                backend.queues.push(ms);
+            }
+            if let Some(ms) = record.time_to_first_byte_ms {
+                backend.first_bytes.push(ms);
+            }
+        }
     }
 
     // Records are appended in completion order, which is close enough to
@@ -372,6 +462,17 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
 
     summary.by_key = sorted_by_requests(keys, |totals| totals.requests);
     summary.by_path = sorted_by_requests(paths, |totals| totals.requests);
+    summary.by_backend = backends
+        .into_iter()
+        .map(|(id, totals)| (id.to_owned(), totals.finish()))
+        .collect();
+    summary.by_backend.sort_by(|left, right| {
+        right
+            .1
+            .requests
+            .cmp(&left.1.requests)
+            .then_with(|| left.0.cmp(&right.0))
+    });
 
     summary
 }
@@ -563,7 +664,47 @@ pub fn summary_lines(path: &Path, summary: &Summary, malformed: u64) -> Vec<Stri
         ));
     }
 
+    if !summary.by_backend.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "  {:<18}{:>10}{:>8}{:>12}{:>12}{:>9}{:>11}{:>11}{:>11}",
+            "BACKEND", "REQUESTS", "SHARE", "IN", "OUT", "ERRORS", "QUEUE95", "TTFB95", "LATENCY95"
+        ));
+        let routed: usize = summary
+            .by_backend
+            .iter()
+            .map(|(_, totals)| totals.requests)
+            .sum();
+        for (backend, totals) in &summary.by_backend {
+            let share = if routed == 0 {
+                0.0
+            } else {
+                totals.requests as f64 * 100.0 / routed as f64
+            };
+            lines.push(format!(
+                "  {:<18}{:>10}{:>7.1}%{:>12}{:>12}{:>9}{:>11}{:>11}{:>11}",
+                truncate(backend, 17),
+                thousands(totals.requests as u64),
+                share,
+                thousands(totals.input_tokens),
+                thousands(totals.output_tokens),
+                totals.errors,
+                distribution_p95(totals.queue_ms),
+                distribution_p95(totals.first_byte_ms),
+                distribution_p95(totals.latency_ms),
+            ));
+        }
+    }
+
     lines
+}
+
+fn distribution_p95(distribution: Distribution) -> String {
+    if distribution.samples == 0 {
+        "-".to_owned()
+    } else {
+        duration(distribution.p95)
+    }
 }
 
 /// Write lines to stdout, treating a closed pipe as a normal end.
@@ -826,6 +967,26 @@ mod tests {
         assert!(appended.restarted);
         assert_eq!(appended.records.len(), 1);
         assert_eq!(appended.records[0].request_id, "fresh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inode_replacement_reopens_the_live_log() {
+        let path = std::env::temp_dir().join(format!("proxy-tail-{}.jsonl", uuid::Uuid::new_v4()));
+        let rotated = path.with_extension("jsonl.1");
+        std::fs::write(&path, "{\"request_id\":\"old\"}\n").unwrap();
+        let mut tail = Tail::new(&path);
+        assert_eq!(tail.poll().unwrap().records[0].request_id, "old");
+
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "{\"request_id\":\"new\"}\n").unwrap();
+        let appended = tail.poll().unwrap();
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(rotated).unwrap();
+        assert!(appended.restarted);
+        assert_eq!(appended.records.len(), 1);
+        assert_eq!(appended.records[0].request_id, "new");
     }
 
     #[test]

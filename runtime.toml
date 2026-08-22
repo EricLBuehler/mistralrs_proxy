@@ -1,8 +1,44 @@
+# Declarative topology and policy. Backend modes (active, draining, disabled)
+# are controlled at runtime and persisted separately in backend-state.json.
+schema_version = 1
+
+[routing]
+policy = "least-pressure-v1"
+# KV pressure begins contributing to the routing score above this ratio.
+kv_soft_limit = 0.85
+
+[telemetry]
+# Scrape each backend's Prometheus endpoint in the background.
+scrape_interval_ms = 1000
+scrape_timeout_ms = 750
+stale_after_ms = 5000
+
+[readiness]
+# Probe each backend independently before admitting it to the routing pool.
+probe_interval_ms = 2000
+probe_timeout_ms = 1000
+success_threshold = 2
+failure_threshold = 3
+
 [[backends]]
 id = "gh200-a"
 url = "http://127.0.0.1:18001"
-enabled = true
+# These default to <url>/metrics and <url>/v1/models.
+# metrics_url = "http://127.0.0.1:18001/metrics"
+# readiness_url = "http://127.0.0.1:18001/v1/models"
+# Optional conservative ceiling. It is also the fallback when the backend does
+# not yet report mistralrs_sequences_capacity.
+capacity = 32
+
+[[backends]]
+id = "gh200-b"
+url = "http://127.0.0.1:18002"
+# Explicit probe URLs are useful when metrics or readiness use another port or
+# path. They are shown here to demonstrate every per-backend setting.
+metrics_url = "http://127.0.0.1:19002/metrics"
+readiness_url = "http://127.0.0.1:18002/v1/models"
 
 [registration]
 enabled = true
 # Omit max_keys to allow unlimited registrations.
+# max_keys = 100

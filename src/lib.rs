@@ -1,10 +1,17 @@
 pub mod auth;
+pub mod backend;
+pub mod backend_cli;
+pub mod backend_manage;
+pub mod backend_state;
 pub mod config;
+pub mod control;
 pub mod keys;
 pub mod logging;
 pub mod logs;
 pub mod manage;
 pub mod proxy;
 pub mod register;
+pub mod routing;
 pub mod runtime;
+pub mod telemetry;
 pub mod usage;

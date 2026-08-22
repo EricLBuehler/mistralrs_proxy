@@ -20,7 +20,8 @@ use ratatui::{
 };
 
 use super::{
-    LogRecord, Summary, Tail, duration, filter, percentile_rows, summarize, thousands, truncate,
+    LogRecord, Summary, Tail, distribution_p95, duration, filter, percentile_rows, summarize,
+    thousands, truncate,
 };
 
 /// How often to look for newly appended records.
@@ -44,22 +45,25 @@ pub fn explore(path: &Path, tail: Tail, records: Vec<LogRecord>) -> Result<(), B
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum View {
     Summary,
+    Backends,
     Requests,
 }
 
 impl View {
-    const ALL: [Self; 2] = [Self::Summary, Self::Requests];
+    const ALL: [Self; 3] = [Self::Summary, Self::Backends, Self::Requests];
 
     const fn title(self) -> &'static str {
         match self {
             Self::Summary => "Summary",
+            Self::Backends => "Backends",
             Self::Requests => "Requests",
         }
     }
 
     const fn next(self) -> Self {
         match self {
-            Self::Summary => Self::Requests,
+            Self::Summary => Self::Backends,
+            Self::Backends => Self::Requests,
             Self::Requests => Self::Summary,
         }
     }
@@ -197,7 +201,8 @@ impl App {
         match code {
             KeyCode::Tab | KeyCode::Right | KeyCode::Left => self.view = self.view.next(),
             KeyCode::Char('1') => self.view = View::Summary,
-            KeyCode::Char('2') => self.view = View::Requests,
+            KeyCode::Char('2') => self.view = View::Backends,
+            KeyCode::Char('3') => self.view = View::Requests,
             KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => self.select((self.selected + 1).min(last)),
             KeyCode::PageUp => self.select(self.selected.saturating_sub(10)),
@@ -287,6 +292,7 @@ impl App {
 
         match self.view {
             View::Summary => self.draw_summary(frame, body),
+            View::Backends => self.draw_backends(frame, body),
             View::Requests => self.draw_requests(frame, body),
         }
 
@@ -435,6 +441,88 @@ impl App {
         );
     }
 
+    fn draw_backends(&self, frame: &mut Frame, area: Rect) {
+        let routed: usize = self
+            .summary
+            .by_backend
+            .iter()
+            .map(|(_, totals)| totals.requests)
+            .sum();
+        let [overview_area, table_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(4)]).areas(area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    label("routed   "),
+                    Span::raw(format!(
+                        "{} request{} across {} backend{}",
+                        thousands(routed as u64),
+                        if routed == 1 { "" } else { "s" },
+                        self.summary.by_backend.len(),
+                        if self.summary.by_backend.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                    )),
+                ]),
+                Line::from(Span::styled(
+                    "Historical request share and latency from proxy.jsonl",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]),
+            overview_area.inner(Margin::new(1, 0)),
+        );
+
+        let rows = self.summary.by_backend.iter().map(|(backend, totals)| {
+            let share = if routed == 0 {
+                0.0
+            } else {
+                totals.requests as f64 * 100.0 / routed as f64
+            };
+            Row::new(vec![
+                Cell::from(truncate(backend, 23)),
+                Cell::from(thousands(totals.requests as u64)),
+                Cell::from(format!("{share:.1}%")),
+                Cell::from(thousands(totals.input_tokens)),
+                Cell::from(thousands(totals.output_tokens)),
+                Cell::from(totals.errors.to_string()),
+                Cell::from(distribution_p95(totals.queue_ms)),
+                Cell::from(distribution_p95(totals.first_byte_ms)),
+                Cell::from(distribution_p95(totals.latency_ms)),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(24),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(9),
+                Constraint::Length(11),
+                Constraint::Length(11),
+                Constraint::Min(11),
+            ],
+        )
+        .header(
+            Row::new([
+                "BACKEND",
+                "REQUESTS",
+                "SHARE",
+                "IN",
+                "OUT",
+                "ERRORS",
+                "QUEUE95",
+                "TTFB95",
+                "LATENCY95",
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+        );
+        frame.render_widget(table, table_area.inner(Margin::new(1, 0)));
+    }
+
     fn draw_requests(&self, frame: &mut Frame, area: Rect) {
         let visible = self.visible();
         let [table_area, detail_area] =
@@ -446,6 +534,7 @@ impl App {
                 Cell::from(record.method.clone()),
                 Cell::from(truncate(record.path(), 27)),
                 Cell::from(truncate(&record.principal(), 21)),
+                Cell::from(truncate(record.backend_id.as_deref().unwrap_or("-"), 15)),
                 Cell::from(
                     record
                         .status
@@ -462,8 +551,9 @@ impl App {
             [
                 Constraint::Length(12),
                 Constraint::Length(6),
-                Constraint::Length(28),
-                Constraint::Length(22),
+                Constraint::Length(24),
+                Constraint::Length(19),
+                Constraint::Length(16),
                 Constraint::Length(6),
                 Constraint::Length(8),
                 Constraint::Length(8),
@@ -472,7 +562,7 @@ impl App {
         )
         .header(
             Row::new(vec![
-                "TIME", "METHOD", "ENDPOINT", "KEY", "STATUS", "TOOK", "IN", "OUT",
+                "TIME", "METHOD", "ENDPOINT", "KEY", "BACKEND", "STATUS", "TOOK", "IN", "OUT",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
         )
@@ -605,6 +695,24 @@ fn detail_lines(record: &LogRecord) -> Vec<Line<'static>> {
             )),
         ]),
         Line::from(vec![
+            label("routing "),
+            Span::raw(format!(
+                "{} via {} ({})   eligible {}   pressure {}   queue {}",
+                record.backend_id.as_deref().unwrap_or("-"),
+                record.routing_policy.as_deref().unwrap_or("-"),
+                record.routing_reason.as_deref().unwrap_or("-"),
+                record
+                    .eligible_backend_count
+                    .map_or_else(|| "-".to_owned(), |count| count.to_string()),
+                record
+                    .backend_pressure_at_dispatch
+                    .map_or_else(|| "-".to_owned(), |value| format!("{value:.3}")),
+                record
+                    .proxy_queue_ms
+                    .map_or_else(|| "-".to_owned(), duration),
+            )),
+        ]),
+        Line::from(vec![
             label("client  "),
             Span::raw(truncate(record.user_agent.as_deref().unwrap_or("-"), 96)),
         ]),
@@ -657,7 +765,7 @@ mod tests {
 
     fn sample_app() -> App {
         app_with(concat!(
-            r#"{"request_id":"aaaaaaaa-0000-0000-0000-000000000001","started_at":"2026-08-20T10:00:00.000Z","started_at_unix_ms":1,"duration_ms":120,"method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"AAAAAAAA","key_sha256":"aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66","key_admin":true,"status":200,"authorized":true,"streaming":true,"input_tokens":1234,"output_tokens":56,"response_bytes":900,"complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5000,"http_version":"HTTP/1.1","user_agent":"openai-python/1.2.3","time_to_first_byte_ms":40}"#,
+            r#"{"request_id":"aaaaaaaa-0000-0000-0000-000000000001","started_at":"2026-08-20T10:00:00.000Z","started_at_unix_ms":1,"duration_ms":120,"method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"AAAAAAAA","key_sha256":"aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66","key_admin":true,"backend_id":"gh200-a","routing_policy":"least-pressure-v1","routing_reason":"fresh_metrics_lowest_pressure","eligible_backend_count":2,"backend_pressure_at_dispatch":0.25,"proxy_queue_ms":1,"status":200,"authorized":true,"streaming":true,"input_tokens":1234,"output_tokens":56,"response_bytes":900,"complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5000,"http_version":"HTTP/1.1","user_agent":"openai-python/1.2.3","time_to_first_byte_ms":40}"#,
             "\n",
             r#"{"request_id":"bbbbbbbb-0000-0000-0000-000000000002","started_at":"2026-08-20T10:00:05.000Z","started_at_unix_ms":2,"duration_ms":3000,"method":"GET","uri":"/v1/models","status":401,"authorized":false,"auth_error":"invalid_api_key","complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5001}"#,
             "\n",
@@ -690,9 +798,24 @@ mod tests {
     }
 
     #[test]
-    fn the_requests_view_lists_rows_and_details_the_selection() {
+    fn the_backends_view_shows_routing_share_and_latency() {
         let mut app = sample_app();
         app.handle(KeyCode::Char('2'));
+
+        let screen = rendered(&app);
+
+        assert!(screen.contains("Backends"), "{screen}");
+        assert!(screen.contains("gh200-a"), "{screen}");
+        assert!(screen.contains("100.0%"), "{screen}");
+        assert!(screen.contains("QUEUE95"), "{screen}");
+        assert!(screen.contains("TTFB95"), "{screen}");
+        assert!(screen.contains("LATENCY95"), "{screen}");
+    }
+
+    #[test]
+    fn the_requests_view_lists_rows_and_details_the_selection() {
+        let mut app = sample_app();
+        app.handle(KeyCode::Char('3'));
 
         let screen = rendered(&app);
 
@@ -711,7 +834,7 @@ mod tests {
     #[test]
     fn moving_down_selects_the_older_record() {
         let mut app = sample_app();
-        app.handle(KeyCode::Char('2'));
+        app.handle(KeyCode::Char('3'));
         app.handle(KeyCode::Down);
 
         let screen = rendered(&app);
@@ -760,7 +883,7 @@ mod tests {
     #[test]
     fn an_empty_log_renders_without_panicking() {
         let mut app = app_with("");
-        app.handle(KeyCode::Char('2'));
+        app.handle(KeyCode::Char('3'));
 
         let screen = rendered(&app);
 
@@ -773,6 +896,8 @@ mod tests {
         let mut app = sample_app();
         assert_eq!(app.view, View::Summary);
 
+        app.handle(KeyCode::Tab);
+        assert_eq!(app.view, View::Backends);
         app.handle(KeyCode::Tab);
         assert_eq!(app.view, View::Requests);
         app.handle(KeyCode::Tab);
@@ -794,7 +919,7 @@ mod tests {
         let mut tail = Tail::new(&path);
         let records = tail.poll().unwrap().records;
         let mut app = App::new(path.clone(), tail, records);
-        app.handle(KeyCode::Char('2'));
+        app.handle(KeyCode::Char('3'));
         app.select(0);
         assert_eq!(app.selected_id.as_deref(), Some("old"));
 

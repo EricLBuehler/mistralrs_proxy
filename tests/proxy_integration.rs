@@ -132,6 +132,13 @@ async fn proxies_an_authorized_request_and_logs_one_record_with_token_counts() {
     assert_eq!(record["key_sha256"], key.sha256);
     assert_eq!(record["key_admin"], true);
     assert_eq!(record["status"], 200);
+    assert_eq!(record["backend_id"], "test");
+    assert_eq!(record["routing_policy"], "least-pressure-v1");
+    assert_eq!(record["routing_reason"], "least_inflight_fallback");
+    assert_eq!(record["eligible_backend_count"], 1);
+    assert_eq!(record["backend_pressure_at_dispatch"], Value::Null);
+    assert_eq!(record["backend_proxy_active_at_dispatch"], 1);
+    assert!(record["proxy_queue_ms"].is_u64());
     assert_eq!(record["input_tokens"], 31);
     assert_eq!(record["output_tokens"], 7);
     assert_eq!(record["total_tokens"], 38);
@@ -313,6 +320,44 @@ async fn a_missing_authorization_header_is_logged_without_a_digest() {
     assert_eq!(record["auth_error"], "invalid_api_key");
     assert_eq!(record["key_sha256"], Value::Null);
     assert_eq!(record["key_name"], Value::Null);
+}
+
+#[tokio::test]
+async fn the_control_namespace_is_never_exposed_or_forwarded_on_the_public_listener() {
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    let upstream = Upstream::start(
+        Router::new()
+            .fallback(upstream_handler)
+            .with_state(observed_tx),
+    )
+    .await;
+    let (keys, _) = one_key();
+    let proxy = Proxy::start(upstream.uri(""), keys).await;
+    let client = http_client();
+
+    for path in ["/control", "/control/backends"] {
+        let response = client
+            .request(
+                Request::builder()
+                    .uri(proxy.url(path))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        response.into_body().collect().await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), observed_rx.recv())
+            .await
+            .is_err(),
+        "the public control namespace reached an upstream"
+    );
+
+    drop(client);
+    assert!(proxy.stop().await.is_empty());
+    upstream.stop().await;
 }
 
 #[tokio::test]

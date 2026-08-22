@@ -17,10 +17,12 @@ use hyper_util::{
 };
 use mistralrs_proxy::{
     auth::KeyStore,
+    backend::BackendId,
     keys::{KeyFile, KeyRecord, SCHEMA_VERSION},
     logging::{self, LogWorker},
     proxy,
-    runtime::{self, Backend, RegistrationConfig, RuntimeConfig, RuntimeState},
+    routing::RoutingState,
+    runtime::{Backend, RegistrationConfig, RuntimeConfig, RuntimeReloadReport, RuntimeState},
 };
 use serde_json::Value;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -122,10 +124,10 @@ pub async fn unbound_addr() -> SocketAddr {
 pub struct Proxy {
     pub addr: SocketAddr,
     backends: RuntimeState,
+    routing: RoutingState,
     log_path: PathBuf,
     keys_path: Option<PathBuf>,
     runtime_path: Option<PathBuf>,
-    reload_task: Option<JoinHandle<()>>,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<()>,
     worker: LogWorker,
@@ -134,14 +136,14 @@ pub struct Proxy {
 impl Proxy {
     pub async fn start(upstream: Uri, keys: KeyStore) -> Self {
         Self::start_with_backends(
-            RuntimeState::new(vec![Backend::new("test", upstream, true)]),
+            RuntimeState::new(vec![Backend::new("test", upstream)]),
             keys,
         )
         .await
     }
 
     pub async fn start_with_backends(backends: RuntimeState, keys: KeyStore) -> Self {
-        Self::start_inner(backends, keys, None, None, None).await
+        Self::start_inner(backends, keys, None, None).await
     }
 
     /// Start with a persistent key database so `/register` can issue keys.
@@ -160,11 +162,10 @@ impl Proxy {
         .save(&path)
         .unwrap();
         let keys = KeyStore::from_file(&path).unwrap();
-        let runtime = RuntimeState::from_config(RuntimeConfig {
-            backends: vec![Backend::new("test", upstream, true)],
-            registration,
-        });
-        let proxy = Self::start_inner(runtime, keys, Some(path), None, None).await;
+        let mut config = RuntimeConfig::new(vec![Backend::new("test", upstream)]);
+        config.registration = registration;
+        let runtime = RuntimeState::from_config(config);
+        let proxy = Self::start_inner(runtime, keys, Some(path), None).await;
 
         (proxy, issued)
     }
@@ -172,9 +173,8 @@ impl Proxy {
     pub async fn start_with_runtime(runtime_path: PathBuf, keys: KeyStore) -> Self {
         let config = RuntimeConfig::load(&runtime_path).await.unwrap();
         let backends = RuntimeState::from_config(config);
-        let reload_task = tokio::spawn(runtime::reload(runtime_path.clone(), backends.clone()));
 
-        Self::start_inner(backends, keys, None, Some(runtime_path), Some(reload_task)).await
+        Self::start_inner(backends, keys, None, Some(runtime_path)).await
     }
 
     async fn start_inner(
@@ -182,15 +182,16 @@ impl Proxy {
         keys: KeyStore,
         keys_path: Option<PathBuf>,
         runtime_path: Option<PathBuf>,
-        reload_task: Option<JoinHandle<()>>,
     ) -> Self {
         let log_path = std::env::temp_dir().join(format!("proxy-test-{}.jsonl", Uuid::new_v4()));
         let (logger, worker) = logging::start(&log_path, false).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = proxy::router(Arc::new(proxy::AppState::new(
+        let routing = RoutingState::new_assume_ready(backends.clone());
+        let app = proxy::router(Arc::new(proxy::AppState::with_routing(
             http_client(),
             backends.clone(),
+            routing.clone(),
             logger,
             keys,
         )));
@@ -210,10 +211,10 @@ impl Proxy {
         Self {
             addr,
             backends,
+            routing,
             log_path,
             keys_path,
             runtime_path,
-            reload_task,
             shutdown,
             task,
             worker,
@@ -226,6 +227,40 @@ impl Proxy {
 
     pub fn configured_backend(&self) -> Backend {
         self.backends.configured()
+    }
+
+    /// Apply the current runtime file immediately, as the control plane does.
+    pub async fn reload_runtime(&self) -> RuntimeReloadReport {
+        self.backends
+            .reload(
+                self.runtime_path
+                    .as_deref()
+                    .expect("this proxy does not have a runtime file"),
+            )
+            .await
+            .unwrap()
+    }
+
+    pub fn disable_backend(&self, id: &str) {
+        self.backends
+            .registry()
+            .get(&BackendId::from(id))
+            .expect("configured backend is registered")
+            .disable();
+    }
+
+    pub fn activate_backend(&self, id: &str) {
+        self.backends
+            .registry()
+            .get(&BackendId::from(id))
+            .expect("configured backend is registered")
+            .activate()
+            .unwrap();
+        // The production readiness worker must qualify a replacement topology
+        // afresh. This in-process harness has no worker, so emulate its two
+        // configured successes after the endpoint generation changes.
+        self.routing.record_readiness_success(id);
+        self.routing.record_readiness_success(id);
     }
 
     pub fn registration_config(&self) -> RegistrationConfig {
@@ -241,10 +276,6 @@ impl Proxy {
     /// Shut the proxy down and return the audit records it wrote.
     pub async fn stop(self) -> Vec<Value> {
         stop(self.shutdown, self.task).await;
-        if let Some(reload_task) = self.reload_task {
-            reload_task.abort();
-            let _ = reload_task.await;
-        }
         self.worker.join().unwrap();
 
         let log = std::fs::read_to_string(&self.log_path).unwrap();

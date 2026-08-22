@@ -7,7 +7,7 @@
 //!
 //! Serialization and file I/O happen on a dedicated OS thread so Tokio's
 //! request workers never touch the disk. The same thread prints the
-//! human-readable arrival and completion lines to stderr.
+//! optional human-readable arrival and completion lines to stderr.
 
 use std::{
     collections::HashMap,
@@ -18,8 +18,8 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     task::{Context, Poll},
     thread::{self, JoinHandle},
@@ -41,26 +41,75 @@ use bytes::Bytes;
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use pin_project_lite::pin_project;
 use serde::Serialize;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::{
     auth::{Authentication, KeyIdentity},
-    usage::UsageSniffer,
+    routing::RoutingDecision,
+    usage::{Usage, UsageSniffer},
 };
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const AUDIT_REQUEST_SLOTS: usize = 4_096;
+// One admitted request emits start, route, optional error, response-start, and
+// finish events. Reserving this many queue positions per request guarantees
+// that terminal events for admitted requests never need to block a Tokio
+// worker, even while the log sink is stalled.
+const MAX_EVENTS_PER_REQUEST: usize = 5;
 
 /// Handle used by the request path to report events. Cloning is cheap.
 #[derive(Clone)]
 pub struct LogSender {
-    tx: Sender<LogEvent>,
-    healthy: Arc<AtomicBool>,
+    tx: SyncSender<LogEvent>,
+    health: Arc<LogHealthState>,
+    admitted: Arc<AtomicUsize>,
+    request_slots: usize,
+}
+
+/// A channel-free handle the serve loop can use to supervise the writer.
+#[derive(Clone)]
+pub struct LogHealth {
+    state: Arc<LogHealthState>,
+}
+
+struct LogHealthState {
+    healthy: AtomicBool,
+    failed: Notify,
+}
+
+struct WriterHealthGuard(Arc<LogHealthState>);
+
+impl Drop for WriterHealthGuard {
+    fn drop(&mut self) {
+        // Also runs if the writer panics, so the async serve supervisor never
+        // continues indefinitely after an unexpected thread exit.
+        self.0.mark_failed();
+    }
 }
 
 /// Join handle for the writer thread.
 pub struct LogWorker {
     thread: JoinHandle<io::Result<()>>,
+    finished: Receiver<()>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditAdmissionError {
+    Unavailable,
+    Saturated,
+}
+
+impl std::fmt::Display for AuditAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "the audit writer is unavailable",
+            Self::Saturated => "the audit writer has reached its admitted-request limit",
+        })
+    }
+}
+
+impl std::error::Error for AuditAdmissionError {}
 
 /// How a request ended.
 #[derive(Debug)]
@@ -141,6 +190,7 @@ enum LogEvent {
         id: Uuid,
         at_unix_ms: u64,
         info: Box<RequestInfo>,
+        permit: AuditPermit,
     },
     ResponseStarted {
         id: Uuid,
@@ -151,32 +201,96 @@ enum LogEvent {
         id: Uuid,
         error: String,
     },
-    /// Sent once, when the first body byte reaches the client. Separate from
-    /// `ResponseChunk` so the clock is read once per request, not per frame.
-    FirstResponseChunk {
+    RequestRouted {
         id: Uuid,
         at_unix_ms: u64,
-    },
-    ResponseChunk {
-        id: Uuid,
-        bytes: Bytes,
+        routing: Box<RoutingInfo>,
     },
     ResponseFinished {
         id: Uuid,
         at_unix_ms: u64,
         outcome: BodyOutcome,
+        observation: BodyObservation,
     },
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BodyObservation {
+    first_byte_at_unix_ms: Option<u64>,
+    response_bytes: u64,
+    usage: Usage,
+}
+
 struct Pending {
+    _permit: AuditPermit,
     started_at_unix_ms: u64,
     info: Box<RequestInfo>,
     status: Option<StatusCode>,
     streaming: bool,
     first_byte_at_unix_ms: Option<u64>,
     response_bytes: u64,
-    sniffer: UsageSniffer,
+    usage: Usage,
     error: Option<String>,
+    routing: Option<Box<RoutingInfo>>,
+    routed_at_unix_ms: Option<u64>,
+}
+
+struct AuditPermit {
+    admitted: Arc<AtomicUsize>,
+}
+
+impl Drop for AuditPermit {
+    fn drop(&mut self) {
+        let previous = self.admitted.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "audit admission permit released twice");
+    }
+}
+
+/// Routing context copied into the final request audit record. A request that
+/// was rejected before routing leaves these fields absent; an authorized
+/// request with no eligible backend records a reason but no backend id.
+#[derive(Clone, Debug, Default)]
+pub struct RoutingInfo {
+    pub backend_id: Option<String>,
+    pub routing_policy: Option<&'static str>,
+    pub routing_reason: Option<&'static str>,
+    pub eligible_backend_count: Option<usize>,
+    pub backend_pressure_at_dispatch: Option<f64>,
+    pub backend_running_at_dispatch: Option<u64>,
+    pub backend_waiting_at_dispatch: Option<u64>,
+    pub backend_capacity_at_dispatch: Option<u64>,
+    pub backend_kv_pressure_at_dispatch: Option<f64>,
+    pub backend_metrics_age_ms: Option<u64>,
+    pub backend_proxy_active_at_dispatch: Option<usize>,
+}
+
+impl From<&RoutingDecision> for RoutingInfo {
+    fn from(decision: &RoutingDecision) -> Self {
+        Self {
+            backend_id: Some(decision.backend_id.clone()),
+            routing_policy: Some(decision.routing_policy),
+            routing_reason: Some(decision.routing_reason),
+            eligible_backend_count: Some(decision.eligible_backend_count),
+            backend_pressure_at_dispatch: decision.backend_pressure_at_dispatch,
+            backend_running_at_dispatch: decision.backend_running_at_dispatch,
+            backend_waiting_at_dispatch: decision.backend_waiting_at_dispatch,
+            backend_capacity_at_dispatch: decision.backend_capacity_at_dispatch,
+            backend_kv_pressure_at_dispatch: decision.backend_kv_pressure_at_dispatch,
+            backend_metrics_age_ms: decision.backend_metrics_age_ms,
+            backend_proxy_active_at_dispatch: Some(decision.backend_proxy_active_at_dispatch),
+        }
+    }
+}
+
+impl RoutingInfo {
+    pub fn unavailable(reason: &'static str) -> Self {
+        Self {
+            routing_policy: Some("least-pressure-v1"),
+            routing_reason: Some(reason),
+            eligible_backend_count: Some(0),
+            ..Self::default()
+        }
+    }
 }
 
 /// Open the JSONL sink and spawn the writer thread.
@@ -208,21 +322,75 @@ fn start_with_writer(
     writer: Box<dyn Write + Send>,
     terminal_log: bool,
 ) -> io::Result<(LogSender, LogWorker)> {
-    let (tx, rx) = mpsc::channel();
-    let healthy = Arc::new(AtomicBool::new(true));
-    let worker_health = Arc::clone(&healthy);
+    start_with_writer_and_slots(writer, terminal_log, AUDIT_REQUEST_SLOTS)
+}
+
+fn start_with_writer_and_slots(
+    writer: Box<dyn Write + Send>,
+    terminal_log: bool,
+    request_slots: usize,
+) -> io::Result<(LogSender, LogWorker)> {
+    assert!(
+        request_slots > 0,
+        "the audit admission limit must be positive"
+    );
+    let event_slots = request_slots
+        .checked_mul(MAX_EVENTS_PER_REQUEST)
+        .expect("audit event capacity exhausted usize");
+    let (tx, rx) = mpsc::sync_channel(event_slots);
+    let (finished_tx, finished) = mpsc::sync_channel(1);
+    let health = Arc::new(LogHealthState {
+        healthy: AtomicBool::new(true),
+        failed: Notify::new(),
+    });
+    let worker_health = Arc::clone(&health);
     let thread = thread::Builder::new()
         .name("json-log-writer".to_owned())
         .spawn(move || {
+            let _health_guard = WriterHealthGuard(worker_health);
             let result = run_worker(rx, writer, terminal_log);
             if let Err(error) = &result {
-                worker_health.store(false, Ordering::Release);
                 eprintln!("JSON log worker stopped: {error}");
             }
+            let _ = finished_tx.send(());
             result
         })?;
 
-    Ok((LogSender { tx, healthy }, LogWorker { thread }))
+    Ok((
+        LogSender {
+            tx,
+            health,
+            admitted: Arc::new(AtomicUsize::new(0)),
+            request_slots,
+        },
+        LogWorker { thread, finished },
+    ))
+}
+
+impl LogHealthState {
+    fn mark_failed(&self) {
+        if self.healthy.swap(false, Ordering::AcqRel) {
+            // There is one serve supervisor. `notify_one` retains a permit if
+            // failure happens between its atomic check and the first poll.
+            self.failed.notify_one();
+        }
+    }
+}
+
+impl LogHealth {
+    pub fn is_healthy(&self) -> bool {
+        self.state.healthy.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_until_unhealthy(&self) {
+        loop {
+            let failed = self.state.failed.notified();
+            if !self.is_healthy() {
+                return;
+            }
+            failed.await;
+        }
+    }
 }
 
 impl LogWorker {
@@ -231,13 +399,34 @@ impl LogWorker {
             .join()
             .map_err(|_| io::Error::other("JSON log worker panicked"))?
     }
+
+    /// Wait at most `timeout` for the writer to finish, then detach it so a
+    /// wedged filesystem cannot prevent process shutdown indefinitely.
+    pub fn join_timeout(self, timeout: Duration) -> io::Result<()> {
+        match self.finished.recv_timeout(timeout) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => self.join(),
+            Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "audit writer exceeded the {}s shutdown grace and was detached",
+                    timeout.as_secs_f64()
+                ),
+            )),
+        }
+    }
 }
 
 impl LogSender {
     /// False once the writer has failed. The proxy then fails closed rather
     /// than serving traffic with no audit trail.
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Acquire)
+        self.health.healthy.load(Ordering::Acquire)
+    }
+
+    pub fn health(&self) -> LogHealth {
+        LogHealth {
+            state: Arc::clone(&self.health),
+        }
     }
 
     /// Record an arriving request.
@@ -247,18 +436,55 @@ impl LogSender {
     /// worker's pending map forever. Call [`RequestGuard::disarm`] once a
     /// response body has been handed to [`Self::response_body`].
     #[must_use = "the guard closes out abandoned requests"]
-    pub fn request_started(&self, id: Uuid, info: RequestInfo) -> RequestGuard {
-        self.send(LogEvent::RequestStarted {
+    pub fn request_started(
+        &self,
+        id: Uuid,
+        info: RequestInfo,
+    ) -> Result<RequestGuard, AuditAdmissionError> {
+        if !self.is_healthy() {
+            return Err(AuditAdmissionError::Unavailable);
+        }
+        self.admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.request_slots).then_some(current + 1)
+            })
+            .map_err(|_| AuditAdmissionError::Saturated)?;
+        let permit = AuditPermit {
+            admitted: Arc::clone(&self.admitted),
+        };
+
+        // Close the small race in which the writer failed while this request
+        // was reserving its slot. No backend work is allowed until this method
+        // has successfully admitted and enqueued the start event.
+        if !self.is_healthy() {
+            drop(permit);
+            return Err(AuditAdmissionError::Unavailable);
+        }
+        match self.tx.try_send(LogEvent::RequestStarted {
             id,
             at_unix_ms: now_unix_ms(),
             info: Box::new(info),
-        });
+            permit,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                // The channel is provisioned for every possible event from
+                // each admitted request, so fullness indicates an invariant
+                // violation. Fail closed instead of losing the start record.
+                self.health.mark_failed();
+                return Err(AuditAdmissionError::Unavailable);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.health.mark_failed();
+                return Err(AuditAdmissionError::Unavailable);
+            }
+        }
 
-        RequestGuard {
+        Ok(RequestGuard {
             logger: self.clone(),
             id,
             armed: true,
-        }
+        })
     }
 
     pub fn response_started(&self, id: Uuid, parts: &response::Parts) {
@@ -277,6 +503,15 @@ impl LogSender {
         });
     }
 
+    /// Record the backend decision while the request is still pending.
+    pub fn request_routed(&self, id: Uuid, routing: RoutingInfo) {
+        self.send(LogEvent::RequestRouted {
+            id,
+            at_unix_ms: now_unix_ms(),
+            routing: Box::new(routing),
+        });
+    }
+
     /// Wrap a response body so its bytes are counted and scanned for token
     /// usage on the way to the client. The bytes themselves are never stored.
     pub fn response_body(&self, id: Uuid, body: Body) -> Body {
@@ -284,18 +519,29 @@ impl LogSender {
     }
 
     pub(crate) fn response_finished(&self, id: Uuid, outcome: BodyOutcome) {
+        self.response_finished_with_observation(id, outcome, BodyObservation::default());
+    }
+
+    fn response_finished_with_observation(
+        &self,
+        id: Uuid,
+        outcome: BodyOutcome,
+        observation: BodyObservation,
+    ) {
         self.send(LogEvent::ResponseFinished {
             id,
             at_unix_ms: now_unix_ms(),
             outcome,
+            observation,
         });
     }
 
     fn send(&self, event: LogEvent) {
-        // std's MPSC channel is unbounded, so this never waits for disk I/O and
-        // never intentionally drops an audit event.
-        if self.tx.send(event).is_err() {
-            self.healthy.store(false, Ordering::Release);
+        // Events are compact and bounded per request: response bytes are
+        // counted and scanned on the body path, then only the final counters
+        // cross this channel. Disk I/O can therefore never retain body frames.
+        if self.tx.try_send(event).is_err() {
+            self.health.mark_failed();
         }
     }
 }
@@ -335,7 +581,9 @@ struct CompletionGuard {
     logger: LogSender,
     id: Uuid,
     finished: bool,
-    saw_data: bool,
+    first_byte_at_unix_ms: Option<u64>,
+    response_bytes: u64,
+    sniffer: UsageSniffer,
 }
 
 impl ObservedBody {
@@ -347,7 +595,9 @@ impl ObservedBody {
                 logger,
                 id,
                 finished: false,
-                saw_data: false,
+                first_byte_at_unix_ms: None,
+                response_bytes: 0,
+                sniffer: UsageSniffer::new(),
             },
         };
 
@@ -372,17 +622,14 @@ impl HttpBody for ObservedBody {
         match this.inner.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(bytes) = frame.data_ref() {
-                    if !this.completion.saw_data {
-                        this.completion.saw_data = true;
-                        this.completion.logger.send(LogEvent::FirstResponseChunk {
-                            id: this.completion.id,
-                            at_unix_ms: now_unix_ms(),
-                        });
+                    if this.completion.first_byte_at_unix_ms.is_none() {
+                        this.completion.first_byte_at_unix_ms = Some(now_unix_ms());
                     }
-                    this.completion.logger.send(LogEvent::ResponseChunk {
-                        id: this.completion.id,
-                        bytes: bytes.clone(),
-                    });
+                    this.completion.response_bytes = this
+                        .completion
+                        .response_bytes
+                        .saturating_add(bytes.len() as u64);
+                    this.completion.sniffer.feed(bytes);
                 }
                 // Consumers commonly stop polling after a frame for which the
                 // inner body reports end-of-stream, so observe that transition
@@ -420,7 +667,15 @@ impl CompletionGuard {
             return;
         }
         self.finished = true;
-        self.logger.response_finished(self.id, outcome);
+        self.logger.response_finished_with_observation(
+            self.id,
+            outcome,
+            BodyObservation {
+                first_byte_at_unix_ms: self.first_byte_at_unix_ms,
+                response_bytes: self.response_bytes,
+                usage: self.sniffer.usage().unwrap_or_default(),
+            },
+        );
     }
 }
 
@@ -494,6 +749,7 @@ fn handle_event(
             id,
             at_unix_ms,
             info,
+            permit,
         } => {
             if terminal_log {
                 eprintln!(
@@ -508,14 +764,17 @@ fn handle_event(
             pending.insert(
                 id,
                 Pending {
+                    _permit: permit,
                     started_at_unix_ms: at_unix_ms,
                     info,
                     status: None,
                     streaming: false,
                     first_byte_at_unix_ms: None,
                     response_bytes: 0,
-                    sniffer: UsageSniffer::new(),
+                    usage: Usage::default(),
                     error: None,
+                    routing: None,
+                    routed_at_unix_ms: None,
                 },
             );
             Ok(false)
@@ -537,16 +796,14 @@ fn handle_event(
             }
             Ok(false)
         }
-        LogEvent::FirstResponseChunk { id, at_unix_ms } => {
+        LogEvent::RequestRouted {
+            id,
+            at_unix_ms,
+            routing,
+        } => {
             if let Some(entry) = pending.get_mut(&id) {
-                entry.first_byte_at_unix_ms.get_or_insert(at_unix_ms);
-            }
-            Ok(false)
-        }
-        LogEvent::ResponseChunk { id, bytes } => {
-            if let Some(entry) = pending.get_mut(&id) {
-                entry.response_bytes = entry.response_bytes.saturating_add(bytes.len() as u64);
-                entry.sniffer.feed(&bytes);
+                entry.routing = Some(routing);
+                entry.routed_at_unix_ms = Some(at_unix_ms);
             }
             Ok(false)
         }
@@ -554,8 +811,12 @@ fn handle_event(
             id,
             at_unix_ms,
             outcome,
+            observation,
         } => match pending.remove(&id) {
-            Some(entry) => {
+            Some(mut entry) => {
+                entry.first_byte_at_unix_ms = observation.first_byte_at_unix_ms;
+                entry.response_bytes = observation.response_bytes;
+                entry.usage = observation.usage;
                 write_record(writer, id, entry, at_unix_ms, outcome, terminal_log)?;
                 Ok(true)
             }
@@ -587,6 +848,18 @@ struct RequestRecord<'a> {
     key_identifier: Option<&'a str>,
     key_sha256: Option<&'a str>,
     key_admin: Option<bool>,
+    backend_id: Option<&'a str>,
+    routing_policy: Option<&'static str>,
+    routing_reason: Option<&'static str>,
+    eligible_backend_count: Option<usize>,
+    backend_pressure_at_dispatch: Option<f64>,
+    backend_running_at_dispatch: Option<u64>,
+    backend_waiting_at_dispatch: Option<u64>,
+    backend_capacity_at_dispatch: Option<u64>,
+    backend_kv_pressure_at_dispatch: Option<f64>,
+    backend_metrics_age_ms: Option<u64>,
+    backend_proxy_active_at_dispatch: Option<usize>,
+    proxy_queue_ms: Option<u64>,
     status: Option<u16>,
     streaming: bool,
     response_bytes: u64,
@@ -608,9 +881,10 @@ fn write_record(
 ) -> io::Result<()> {
     let (complete, termination, outcome_error) = outcome.describe();
     let error = entry.error.as_deref().or(outcome_error);
-    let usage = entry.sniffer.usage().unwrap_or_default();
+    let usage = entry.usage;
     let duration_ms = finished_at_unix_ms.saturating_sub(entry.started_at_unix_ms);
     let info = &entry.info;
+    let routing = entry.routing.as_deref();
 
     if terminal_log {
         eprintln!(
@@ -661,6 +935,26 @@ fn write_record(
             .map(|identity| identity.identifier.as_str()),
         key_sha256: info.key_sha256.as_deref(),
         key_admin: info.identity.as_ref().map(|identity| identity.admin),
+        backend_id: routing.and_then(|routing| routing.backend_id.as_deref()),
+        routing_policy: routing.and_then(|routing| routing.routing_policy),
+        routing_reason: routing.and_then(|routing| routing.routing_reason),
+        eligible_backend_count: routing.and_then(|routing| routing.eligible_backend_count),
+        backend_pressure_at_dispatch: routing
+            .and_then(|routing| routing.backend_pressure_at_dispatch),
+        backend_running_at_dispatch: routing
+            .and_then(|routing| routing.backend_running_at_dispatch),
+        backend_waiting_at_dispatch: routing
+            .and_then(|routing| routing.backend_waiting_at_dispatch),
+        backend_capacity_at_dispatch: routing
+            .and_then(|routing| routing.backend_capacity_at_dispatch),
+        backend_kv_pressure_at_dispatch: routing
+            .and_then(|routing| routing.backend_kv_pressure_at_dispatch),
+        backend_metrics_age_ms: routing.and_then(|routing| routing.backend_metrics_age_ms),
+        backend_proxy_active_at_dispatch: routing
+            .and_then(|routing| routing.backend_proxy_active_at_dispatch),
+        proxy_queue_ms: entry
+            .routed_at_unix_ms
+            .map(|at| at.saturating_sub(entry.started_at_unix_ms)),
         status: entry.status.map(|status| status.as_u16()),
         streaming: entry.streaming,
         response_bytes: entry.response_bytes,
@@ -797,6 +1091,7 @@ mod tests {
                 id,
                 RequestInfo::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)), &parts, &auth),
             )
+            .unwrap()
             .disarm();
 
         let response = axum::response::Response::builder()
@@ -844,6 +1139,7 @@ mod tests {
                     &auth,
                 ),
             )
+            .unwrap()
             .disarm();
 
         let response = axum::response::Response::builder()
@@ -861,6 +1157,33 @@ mod tests {
 
         assert!(!logger.is_healthy());
         assert!(worker.join().is_err());
+    }
+
+    #[test]
+    fn audit_admission_is_bounded_before_a_request_can_route() {
+        let (logger, worker) =
+            start_with_writer_and_slots(Box::new(Vec::<u8>::new()), false, 1).unwrap();
+        let (store, key) = store_and_key();
+        let request = Request::builder()
+            .uri("/v1/models")
+            .header("authorization", format!("Bearer {key}"))
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+        let auth = authenticate(&parts.headers, &store);
+        let info =
+            || RequestInfo::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)), &parts, &auth);
+
+        let first = logger.request_started(Uuid::new_v4(), info()).unwrap();
+        assert!(matches!(
+            logger.request_started(Uuid::new_v4(), info()),
+            Err(AuditAdmissionError::Saturated)
+        ));
+        assert!(logger.is_healthy(), "backpressure is not writer failure");
+
+        drop(first);
+        drop(logger);
+        worker.join().unwrap();
     }
 
     #[tokio::test]

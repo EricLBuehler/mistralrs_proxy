@@ -10,8 +10,8 @@ bytes = "1.12.1"
 clap = { version = "4.5.60", features = ["derive", "env"] }
 getrandom = { version = "0.4.3", features = ["std"] }
 http-body-util = "0.1.5"
-hyper = "1.11.0"
-hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
+hyper = { version = "1.11.0", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "server-auto", "service", "tokio"] }
 pin-project-lite = "0.2.16"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -20,4 +20,4 @@ sha2 = "0.10.9"
 subtle = "2.6.1"
 tokio = { version = "1.53", features = ["full"] }
 toml = "0.9"
-uuid = { version = "1.24.1", features = ["v4"] }
+uuid = { version = "1.24.1", features = ["serde", "v4"] }

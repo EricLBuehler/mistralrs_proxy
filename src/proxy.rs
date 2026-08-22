@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use axum::{
     Json, Router,
@@ -13,15 +18,18 @@ use axum::{
         request,
     },
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{any, get},
 };
+use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use pin_project_lite::pin_project;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     auth::{AuthError, KeyStore, authenticate},
-    logging::{LogSender, RequestInfo},
+    logging::{AuditAdmissionError, LogSender, RequestInfo, RoutingInfo},
+    routing::{BackendResponseGuard, RoutingState},
     runtime::RuntimeState,
 };
 
@@ -32,6 +40,7 @@ const IDENTITY: HeaderValue = HeaderValue::from_static("identity");
 pub struct AppState {
     client: HttpClient,
     pub(crate) runtime: RuntimeState,
+    routing: RoutingState,
     logger: LogSender,
     pub(crate) keys: KeyStore,
 }
@@ -43,9 +52,21 @@ impl AppState {
         logger: LogSender,
         keys: KeyStore,
     ) -> Self {
+        let routing = RoutingState::new_assume_ready(runtime.clone());
+        Self::with_routing(client, runtime, routing, logger, keys)
+    }
+
+    pub fn with_routing(
+        client: HttpClient,
+        runtime: RuntimeState,
+        routing: RoutingState,
+        logger: LogSender,
+        keys: KeyStore,
+    ) -> Self {
         Self {
             client,
             runtime,
+            routing,
             logger,
             keys,
         }
@@ -60,8 +81,14 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/register", register.clone())
         .route("/register/", register)
+        .route("/control", any(control_not_found))
+        .route("/control/{*path}", any(control_not_found))
         .fallback(proxy)
         .with_state(state)
+}
+
+async fn control_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 /// Authenticate, forward, and log. Every response leaves through
@@ -71,24 +98,33 @@ async fn proxy(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    if !state.logger.is_healthy() {
-        // Nothing can be logged, so answer without attempting to.
-        return json_error_body(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "api_error",
-            "logger_unavailable",
-            "The audit log writer is unavailable; the proxy is failing closed.",
-        );
-    }
-
     let request_id = Uuid::new_v4();
     let (parts, body) = request.into_parts();
     let authentication = authenticate(&parts.headers, &state.keys);
     // Held for the rest of the handler: if the client disconnects while we wait
     // on the upstream, this closes the record out instead of leaking it.
-    let mut guard = state
+    let mut guard = match state
         .logger
-        .request_started(request_id, RequestInfo::new(peer, &parts, &authentication));
+        .request_started(request_id, RequestInfo::new(peer, &parts, &authentication))
+    {
+        Ok(guard) => guard,
+        Err(AuditAdmissionError::Saturated) => {
+            return json_error_body(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "logger_saturated",
+                "The audit log is at its admitted-request limit; retry shortly.",
+            );
+        }
+        Err(AuditAdmissionError::Unavailable) => {
+            return json_error_body(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "logger_unavailable",
+                "The audit log writer is unavailable; the proxy is failing closed.",
+            );
+        }
+    };
 
     let response = match authentication.result {
         Ok(()) => forward(&state, request_id, parts, body).await,
@@ -105,11 +141,21 @@ async fn forward(
     mut parts: request::Parts,
     body: Body,
 ) -> Response {
-    let Some(backend) = state.runtime.available() else {
+    let Some(selection) = state.routing.select() else {
+        state
+            .logger
+            .request_routed(request_id, RoutingInfo::unavailable("no_eligible_backend"));
         return service_unavailable();
     };
+    state
+        .logger
+        .request_routed(request_id, RoutingInfo::from(&selection.decision));
 
-    parts.uri = match upstream_uri(&backend.url, &parts.uri) {
+    let upstream = selection
+        .backend_url()
+        .parse::<Uri>()
+        .expect("backend registry specs came from validated runtime URLs");
+    parts.uri = match upstream_uri(&upstream, &parts.uri) {
         Ok(uri) => uri,
         Err(error) => {
             return json_error_body(
@@ -131,6 +177,7 @@ async fn forward(
     let upstream_response = match state.client.request(Request::from_parts(parts, body)).await {
         Ok(response) => response,
         Err(error) => {
+            selection.record_transport_failure();
             state
                 .logger
                 .request_error(request_id, format!("backend request failed: {error}"));
@@ -138,11 +185,77 @@ async fn forward(
         }
     };
 
+    let status = upstream_response.status();
+    let guard = selection.into_response_guard(status);
     let (mut parts, body) = upstream_response.into_parts();
     parts.version = http::Version::HTTP_11;
     remove_hop_by_hop_headers(&mut parts.headers);
 
-    Response::from_parts(parts, Body::new(body))
+    let body = Body::new(body);
+    Response::from_parts(parts, Body::new(LeasedBody::new(body, guard)))
+}
+
+pin_project! {
+    /// Holds the backend lease until the upstream response reaches EOF or the
+    /// downstream client abandons the body. Dropping any outer logger wrapper
+    /// also drops this value, so a disconnected SSE client releases exactly
+    /// one lease.
+    struct LeasedBody {
+        #[pin]
+        inner: Body,
+        guard: Option<BackendResponseGuard>,
+    }
+}
+
+impl LeasedBody {
+    fn new(inner: Body, mut guard: BackendResponseGuard) -> Self {
+        if inner.is_end_stream() {
+            guard.complete();
+            Self { inner, guard: None }
+        } else {
+            Self {
+                inner,
+                guard: Some(guard),
+            }
+        }
+    }
+}
+
+impl HttpBody for LeasedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(frame) => {
+                if frame.as_ref().is_some_and(Result::is_err) {
+                    if let Some(guard) = this.guard.as_mut() {
+                        guard.body_error();
+                    }
+                    this.guard.take();
+                } else if frame.is_none() || this.inner.is_end_stream() {
+                    if let Some(guard) = this.guard.as_mut() {
+                        guard.complete();
+                    }
+                    this.guard.take();
+                }
+                Poll::Ready(frame)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 fn service_unavailable() -> Response {

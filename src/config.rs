@@ -22,8 +22,75 @@ pub enum Command {
     /// Create and administer API keys.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Inspect and control live inference backends.
+    #[command(subcommand)]
+    Backend(BackendCommand),
     /// Summarise and explore the audit log of a running or finished proxy.
     Logs(LogsArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BackendCommand {
+    /// Print a compact snapshot of every backend.
+    List {
+        /// Emit the control response as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        control: ControlSocket,
+    },
+    /// Show detailed status for one backend, or all backends.
+    Status {
+        backend: Option<String>,
+        /// Refresh continuously until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Emit JSON. With --watch, prints one JSON object per refresh.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        control: ControlSocket,
+    },
+    /// Open the live backend manager.
+    Manage {
+        #[command(flatten)]
+        control: ControlSocket,
+    },
+    /// Stop new assignments and wait until the backend is safe to stop.
+    Drain {
+        backend: String,
+        /// Start the durable drain and return without waiting for completion.
+        #[arg(long)]
+        no_wait: bool,
+        /// Stop waiting after this many seconds; the backend remains draining.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_seconds: Option<u64>,
+        #[command(flatten)]
+        control: ControlSocket,
+    },
+    /// Re-admit a ready, telemetry-fresh disabled backend.
+    Activate {
+        backend: String,
+        #[command(flatten)]
+        control: ControlSocket,
+    },
+    /// Ask the running server to validate and reload its runtime.toml.
+    Reload {
+        #[command(flatten)]
+        control: ControlSocket,
+    },
+}
+
+#[derive(Clone, Debug, ClapArgs)]
+pub struct ControlSocket {
+    /// Private Unix-domain socket owned by the running serve process.
+    #[arg(
+        long,
+        env = "CONTROL_SOCKET",
+        default_value = "control.sock",
+        value_name = "PATH"
+    )]
+    pub control_socket: PathBuf,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -90,7 +157,7 @@ pub struct ServeArgs {
     )]
     pub listen_addr: SocketAddr,
 
-    /// Runtime backend configuration, reloaded while the proxy is running.
+    /// Runtime backend configuration, reloaded explicitly with `backend reload`.
     #[arg(
         long,
         env = "RUNTIME_FILE",
@@ -98,6 +165,18 @@ pub struct ServeArgs {
         value_name = "PATH"
     )]
     pub runtime_file: PathBuf,
+
+    #[command(flatten)]
+    pub control: ControlSocket,
+
+    /// Durable backend drain/disable state, separate from runtime.toml.
+    #[arg(
+        long,
+        env = "BACKEND_STATE_FILE",
+        default_value = "backend-state.json",
+        value_name = "PATH"
+    )]
+    pub backend_state_file: PathBuf,
 
     /// Maximum time to establish a connection to the upstream.
     #[arg(
@@ -113,7 +192,7 @@ pub struct ServeArgs {
     #[arg(long, env = "LOG_FILE", default_value = "proxy.jsonl")]
     pub log_file: PathBuf,
 
-    /// Do not print per-request lines to stderr.
+    /// Do not print operational lifecycle and backend state changes.
     #[arg(long, env = "QUIET")]
     pub quiet: bool,
 }
@@ -139,6 +218,8 @@ mod tests {
         assert_eq!(args.keys.keys_file, PathBuf::from("keys.json"));
         assert_eq!(args.listen_addr, "127.0.0.1:3000".parse().unwrap());
         assert_eq!(args.runtime_file, PathBuf::from("runtime.toml"));
+        assert_eq!(args.control.control_socket, PathBuf::from("control.sock"));
+        assert_eq!(args.backend_state_file, PathBuf::from("backend-state.json"));
         assert_eq!(args.connect_timeout_ms, 5_000);
         assert_eq!(args.log_file, PathBuf::from("proxy.jsonl"));
         assert!(!args.quiet);
@@ -216,5 +297,34 @@ mod tests {
     #[test]
     fn a_subcommand_is_required() {
         assert!(Cli::try_parse_from(["mistralrs_proxy"]).is_err());
+    }
+
+    #[test]
+    fn backend_commands_share_the_control_socket_option() {
+        let cli = Cli::try_parse_from([
+            "mistralrs_proxy",
+            "backend",
+            "drain",
+            "gh200-a",
+            "--control-socket",
+            "/run/proxy.sock",
+            "--timeout-seconds",
+            "30",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Backend(BackendCommand::Drain {
+                backend,
+                no_wait,
+                timeout_seconds,
+                control,
+            }) => {
+                assert_eq!(backend, "gh200-a");
+                assert!(!no_wait);
+                assert_eq!(timeout_seconds, Some(30));
+                assert_eq!(control.control_socket, PathBuf::from("/run/proxy.sock"));
+            }
+            other => panic!("expected backend drain, got {other:?}"),
+        }
     }
 }

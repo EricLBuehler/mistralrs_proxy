@@ -95,6 +95,7 @@ impl Harness {
                 id,
                 RequestInfo::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)), &parts, &auth),
             )
+            .unwrap()
             .disarm();
     }
 
