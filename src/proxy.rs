@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::{
     auth::{AuthError, KeyStore, authenticate},
     logging::{LogSender, RequestInfo},
+    runtime::BackendList,
 };
 
 pub type HttpClient = Client<HttpConnector, Body>;
@@ -29,16 +30,21 @@ const IDENTITY: HeaderValue = HeaderValue::from_static("identity");
 
 pub struct AppState {
     client: HttpClient,
-    upstream: Uri,
+    backends: BackendList,
     logger: LogSender,
     keys: KeyStore,
 }
 
 impl AppState {
-    pub fn new(client: HttpClient, upstream: Uri, logger: LogSender, keys: KeyStore) -> Self {
+    pub fn new(
+        client: HttpClient,
+        backends: BackendList,
+        logger: LogSender,
+        keys: KeyStore,
+    ) -> Self {
         Self {
             client,
-            upstream,
+            backends,
             logger,
             keys,
         }
@@ -85,7 +91,16 @@ async fn proxy(
 }
 
 async fn forward(state: &AppState, mut parts: request::Parts, body: Body) -> Response {
-    parts.uri = match upstream_uri(&state.upstream, &parts.uri) {
+    let Some(backend) = state.backends.available() else {
+        return json_error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "backend_unavailable",
+            "No enabled backend is currently available.",
+        );
+    };
+
+    parts.uri = match upstream_uri(&backend.url, &parts.uri) {
         Ok(uri) => uri,
         Err(error) => {
             return json_error_body(

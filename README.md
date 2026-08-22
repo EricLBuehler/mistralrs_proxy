@@ -27,8 +27,17 @@ path). Keep it private — `chmod 600` is applied for you.
 
 ## Run
 
+Configure the backend in `runtime.toml`:
+
+```toml
+[[backends]]
+id = "gh200-a"
+url = "http://127.0.0.1:1234"
+enabled = true
+```
+
 ```console
-mistralrs_proxy serve --upstream-url http://127.0.0.1:1234
+mistralrs_proxy serve
 ```
 
 Options (each also settable by environment variable):
@@ -37,13 +46,17 @@ Options (each also settable by environment variable):
 | --- | --- | --- |
 | `--keys-file` | `KEYS_FILE` | `keys.json` |
 | `--listen-addr` | `LISTEN_ADDR` | `127.0.0.1:3000` |
-| `--upstream-url` | `UPSTREAM_URL` | `http://127.0.0.1:1234` |
+| `--runtime-file` | `RUNTIME_FILE` | `runtime.toml` |
 | `--connect-timeout-ms` | `CONNECT_TIMEOUT_MS` | `5000` |
 | `--log-file` | `LOG_FILE` | `proxy.jsonl` |
 | `--quiet` | `QUIET` | off |
 
-The upstream must be plain `http://`. Run `mistralrs_proxy serve --help` for
-the full list.
+Exactly one backend must be present for now, and its URL must be plain
+`http://`. The file is reloaded every 500 ms, so URL and `enabled` changes take
+effect without restarting. Set `enabled = false` to take the backend out of
+service; requests then receive a `503 backend_unavailable` response. If a
+reload finds a missing or malformed file, the proxy keeps the last valid
+configuration. Run `mistralrs_proxy serve --help` for the full option list.
 
 Keys are read once at startup. After creating, changing, or deleting a key,
 restart the proxy.

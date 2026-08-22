@@ -1,6 +1,5 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-use axum::http::Uri;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -91,15 +90,14 @@ pub struct ServeArgs {
     )]
     pub listen_addr: SocketAddr,
 
-    /// HTTP upstream origin (an optional path prefix is supported).
+    /// Runtime backend configuration, reloaded while the proxy is running.
     #[arg(
-        short = 'u',
         long,
-        env = "UPSTREAM_URL",
-        default_value = "http://127.0.0.1:1234",
-        value_parser = parse_upstream_url
+        env = "RUNTIME_FILE",
+        default_value = "runtime.toml",
+        value_name = "PATH"
     )]
-    pub upstream_url: Uri,
+    pub runtime_file: PathBuf,
 
     /// Maximum time to establish a connection to the upstream.
     #[arg(
@@ -118,27 +116,6 @@ pub struct ServeArgs {
     /// Do not print per-request lines to stderr.
     #[arg(long, env = "QUIET")]
     pub quiet: bool,
-}
-
-fn parse_upstream_url(value: &str) -> Result<Uri, String> {
-    let uri = value
-        .parse::<Uri>()
-        .map_err(|error| format!("invalid URI: {error}"))?;
-
-    if uri.scheme_str() != Some("http") {
-        return Err("upstream URL must use http:// (this build has no TLS connector)".to_owned());
-    }
-    let Some(authority) = uri.authority() else {
-        return Err("upstream URL must include a host".to_owned());
-    };
-    if authority.as_str().contains('@') {
-        return Err("upstream URL cannot include user information".to_owned());
-    }
-    if uri.query().is_some() {
-        return Err("upstream URL cannot include a query string".to_owned());
-    }
-
-    Ok(uri)
 }
 
 #[cfg(test)]
@@ -161,25 +138,21 @@ mod tests {
 
         assert_eq!(args.keys.keys_file, PathBuf::from("keys.json"));
         assert_eq!(args.listen_addr, "127.0.0.1:3000".parse().unwrap());
-        assert_eq!(args.upstream_url, "http://127.0.0.1:1234");
+        assert_eq!(args.runtime_file, PathBuf::from("runtime.toml"));
         assert_eq!(args.connect_timeout_ms, 5_000);
         assert_eq!(args.log_file, PathBuf::from("proxy.jsonl"));
         assert!(!args.quiet);
     }
 
     #[test]
-    fn accepts_an_upstream_path_prefix() {
-        let args = serve(&["--upstream-url", "http://127.0.0.1:1234/internal"]).unwrap();
+    fn accepts_a_runtime_file_path() {
+        let args = serve(&["--runtime-file", "/tmp/proxy-runtime.toml"]).unwrap();
 
-        assert_eq!(args.upstream_url.path(), "/internal");
+        assert_eq!(args.runtime_file, PathBuf::from("/tmp/proxy-runtime.toml"));
     }
 
     #[test]
-    fn rejects_unsupported_or_relative_upstreams() {
-        assert!(serve(&["--upstream-url", "https://example.com"]).is_err());
-        assert!(serve(&["--upstream-url", "/relative"]).is_err());
-        assert!(serve(&["--upstream-url", "http://example.com?q=1"]).is_err());
-        assert!(serve(&["--upstream-url", "http://user:pass@example.com"]).is_err());
+    fn rejects_a_zero_connect_timeout() {
         assert!(serve(&["--connect-timeout-ms", "0"]).is_err());
     }
 

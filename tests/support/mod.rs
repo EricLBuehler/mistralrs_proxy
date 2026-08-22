@@ -15,6 +15,7 @@ use mistralrs_proxy::{
     keys::KeyRecord,
     logging::{self, LogWorker},
     proxy,
+    runtime::{self, Backend, BackendList, RuntimeConfig},
 };
 use serde_json::Value;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -109,7 +110,10 @@ pub async fn unbound_addr() -> SocketAddr {
 
 pub struct Proxy {
     pub addr: SocketAddr,
+    backends: BackendList,
     log_path: PathBuf,
+    runtime_path: Option<PathBuf>,
+    reload_task: Option<JoinHandle<()>>,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<()>,
     worker: LogWorker,
@@ -117,13 +121,38 @@ pub struct Proxy {
 
 impl Proxy {
     pub async fn start(upstream: Uri, keys: KeyStore) -> Self {
+        Self::start_with_backends(
+            BackendList::new(vec![Backend::new("test", upstream, true)]),
+            keys,
+        )
+        .await
+    }
+
+    pub async fn start_with_backends(backends: BackendList, keys: KeyStore) -> Self {
+        Self::start_inner(backends, keys, None, None).await
+    }
+
+    pub async fn start_with_runtime(runtime_path: PathBuf, keys: KeyStore) -> Self {
+        let config = RuntimeConfig::load(&runtime_path).await.unwrap();
+        let backends = BackendList::from_config(config);
+        let reload_task = tokio::spawn(runtime::reload(runtime_path.clone(), backends.clone()));
+
+        Self::start_inner(backends, keys, Some(runtime_path), Some(reload_task)).await
+    }
+
+    async fn start_inner(
+        backends: BackendList,
+        keys: KeyStore,
+        runtime_path: Option<PathBuf>,
+        reload_task: Option<JoinHandle<()>>,
+    ) -> Self {
         let log_path = std::env::temp_dir().join(format!("proxy-test-{}.jsonl", Uuid::new_v4()));
         let (logger, worker) = logging::start(&log_path, false).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = proxy::router(Arc::new(proxy::AppState::new(
             http_client(),
-            upstream,
+            backends.clone(),
             logger,
             keys,
         )));
@@ -142,7 +171,10 @@ impl Proxy {
 
         Self {
             addr,
+            backends,
             log_path,
+            runtime_path,
+            reload_task,
             shutdown,
             task,
             worker,
@@ -153,13 +185,24 @@ impl Proxy {
         format!("http://{}{path}", self.addr)
     }
 
+    pub fn configured_backend(&self) -> Backend {
+        self.backends.configured()
+    }
+
     /// Shut the proxy down and return the audit records it wrote.
     pub async fn stop(self) -> Vec<Value> {
         stop(self.shutdown, self.task).await;
+        if let Some(reload_task) = self.reload_task {
+            reload_task.abort();
+            let _ = reload_task.await;
+        }
         self.worker.join().unwrap();
 
         let log = std::fs::read_to_string(&self.log_path).unwrap();
         std::fs::remove_file(&self.log_path).unwrap();
+        if let Some(runtime_path) = self.runtime_path {
+            std::fs::remove_file(runtime_path).unwrap();
+        }
 
         log.lines()
             .map(|line| serde_json::from_str(line).unwrap())
