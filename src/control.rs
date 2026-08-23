@@ -14,7 +14,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path as AxumPath, State, connect_info::Connected},
+    extract::{ConnectInfo, Path as AxumPath, Query, State, connect_info::Connected},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -228,6 +228,7 @@ impl ControlState {
             .route("/backends/{id}", get(get_backend))
             .route("/backends/{id}/drain", post(start_drain))
             .route("/backends/{id}/activate", post(activate_backend))
+            .route("/backends/{id}/disable", post(disable_backend))
             .route("/operations/{id}", get(get_operation))
             .route("/runtime/reload", post(reload_runtime));
         Router::new().nest("/control", routes).with_state(self)
@@ -502,6 +503,67 @@ impl ControlState {
         })
     }
 
+    /// Close the gate and persist the disabled fence without waiting for
+    /// in-flight work.
+    ///
+    /// This is the escape hatch for a backend whose engine is dead: a normal
+    /// drain can never observe the fresh idle telemetry samples it needs to
+    /// complete. An in-progress drain notices the mode change on its next tick
+    /// and completes itself, so a waiting `backend drain` client reports
+    /// `safe to stop`.
+    async fn disable(&self, id: &str, force: bool) -> Result<ActionResponse, ControlError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let status = self
+            .routing
+            .status(id)
+            .ok_or_else(|| ControlError::not_found(format!("unknown backend {id:?}")))?;
+        if status.mode == BackendMode::Disabled {
+            return Ok(ActionResponse {
+                backend_id: id.to_owned(),
+                mode: BackendMode::Disabled,
+                message: "backend is already disabled".to_owned(),
+            });
+        }
+        if !force && status.proxy_active > 0 {
+            return Err(ControlError::conflict(format!(
+                "backend has {} in-flight proxy request{}; rerun with --force to disable anyway",
+                status.proxy_active,
+                if status.proxy_active == 1 { "" } else { "s" }
+            )));
+        }
+        let backend_id = BackendId::from(id);
+        let slot = self
+            .runtime
+            .registry()
+            .get(&backend_id)
+            .ok_or_else(|| ControlError::not_found(format!("unknown backend {id:?}")))?;
+        // Persist the fence before closing the in-memory gate. A crash can
+        // delay reactivation but cannot resurrect a removed backend.
+        self.state_store
+            .set_mode(id, BackendMode::Disabled)
+            .map_err(|error| {
+                ControlError::internal(format!("could not persist disabled state: {error}"))
+            })?;
+        let in_flight = status.proxy_active;
+        slot.disable();
+        if !self.quiet {
+            println!("INFO backend {id} disabled (was {})", status.mode);
+        }
+        let message = if force && in_flight > 0 {
+            format!(
+                "backend disabled with {in_flight} in-flight request{} still running",
+                if in_flight == 1 { "" } else { "s" }
+            )
+        } else {
+            "backend disabled".to_owned()
+        };
+        Ok(ActionResponse {
+            backend_id: id.to_owned(),
+            mode: BackendMode::Disabled,
+            message,
+        })
+    }
+
     async fn reload(&self) -> Result<ReloadResponse, ControlError> {
         let _lifecycle = self.lifecycle.lock().await;
         let modes = self.state_store.modes();
@@ -662,6 +724,20 @@ async fn activate_backend(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ActionResponse>, ControlError> {
     state.activate(&id).await.map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+struct DisableQuery {
+    force: Option<bool>,
+}
+
+async fn disable_backend(
+    State(state): State<Arc<ControlState>>,
+    ConnectInfo(_peer): ConnectInfo<UdsPeer>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<DisableQuery>,
+) -> Result<Json<ActionResponse>, ControlError> {
+    state.disable(&id, query.force.unwrap_or(false)).await.map(Json)
 }
 
 async fn reload_runtime(
@@ -923,6 +999,87 @@ mod tests {
             .set_mode("a", BackendMode::Disabled)
             .unwrap();
         assert!(state.activate("a").await.is_ok());
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(runtime_path);
+    }
+
+    #[tokio::test]
+    async fn disable_closes_the_gate_and_persists_the_fence_immediately() {
+        let (state, state_path, runtime_path) = state();
+        let response = state.disable("a", false).await.unwrap();
+        assert_eq!(response.mode, BackendMode::Disabled);
+        assert_eq!(response.message, "backend disabled");
+        assert_eq!(
+            state.runtime.registry().snapshots()[0].mode,
+            BackendMode::Disabled
+        );
+        assert_eq!(
+            BackendStateStore::load(&state_path).unwrap().modes()["a"],
+            BackendMode::Disabled
+        );
+        // Repeating the command is an idempotent no-op.
+        let again = state.disable("a", false).await.unwrap();
+        assert_eq!(again.message, "backend is already disabled");
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(runtime_path);
+    }
+
+    #[tokio::test]
+    async fn disable_refuses_in_flight_requests_without_force() {
+        let (state, state_path, runtime_path) = state();
+        let id = BackendId::from("a");
+        let lease = state.runtime.registry().try_acquire(&id).unwrap();
+
+        let conflict = state.disable("a", false).await.unwrap_err();
+        assert!(conflict.to_string().contains("in-flight"), "{conflict}");
+        assert_eq!(
+            state.runtime.registry().snapshots()[0].mode,
+            BackendMode::Active
+        );
+
+        let response = state.disable("a", true).await.unwrap();
+        assert_eq!(
+            state.runtime.registry().snapshots()[0].mode,
+            BackendMode::Disabled
+        );
+        assert_eq!(
+            response.message,
+            "backend disabled with 1 in-flight request still running"
+        );
+        // The in-flight request keeps its lease; the gate only blocks new work.
+        assert_eq!(state.runtime.registry().snapshots()[0].local_active, 1);
+        drop(lease);
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(runtime_path);
+    }
+
+    #[tokio::test]
+    async fn disabling_a_draining_backend_completes_its_operation() {
+        let (state, state_path, runtime_path) = state();
+        let operation = state.begin_drain("a").await.unwrap();
+        assert!(!operation.progress.borrow().safe_to_stop);
+
+        state.disable("a", true).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while operation.progress.borrow().phase != DrainPhase::Complete {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let progress = operation.progress.borrow().clone();
+        assert!(progress.safe_to_stop);
+        assert_eq!(progress.phase, DrainPhase::Complete);
+        assert_eq!(progress.message.as_deref(), Some("backend is disabled"));
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(runtime_path);
+    }
+
+    #[tokio::test]
+    async fn disabling_an_unknown_backend_is_a_not_found() {
+        let (state, state_path, runtime_path) = state();
+        let error = state.disable("ghost", true).await.unwrap_err();
+        assert!(error.to_string().contains("unknown backend"), "{error}");
         let _ = fs::remove_file(state_path);
         let _ = fs::remove_file(runtime_path);
     }

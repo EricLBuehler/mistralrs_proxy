@@ -65,6 +65,15 @@ impl ControlClient {
             .await
     }
 
+    pub async fn disable(&self, id: &str, force: bool) -> Result<ActionResponse, ClientError> {
+        let path = if force {
+            format!("/control/backends/{id}/disable?force=true")
+        } else {
+            format!("/control/backends/{id}/disable")
+        };
+        self.request(Method::POST, &path).await
+    }
+
     pub async fn reload(&self) -> Result<ReloadResponse, ClientError> {
         self.request(Method::POST, "/control/runtime/reload").await
     }
@@ -268,6 +277,16 @@ async fn run_async(command: BackendCommand) -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
             wait_for_drain(&client, started, timeout_seconds).await?;
+        }
+        BackendCommand::Disable {
+            backend,
+            force,
+            control,
+        } => {
+            let response = ControlClient::new(control.control_socket)
+                .disable(&backend, force)
+                .await?;
+            println!("{}: {}", response.backend_id, response.message);
         }
         BackendCommand::Activate { backend, control } => {
             let response = ControlClient::new(control.control_socket)

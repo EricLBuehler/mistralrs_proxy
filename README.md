@@ -162,6 +162,7 @@ mistralrs_proxy backend status [BACKEND]
 mistralrs_proxy backend status --watch
 mistralrs_proxy backend manage
 mistralrs_proxy backend drain gh200-a
+mistralrs_proxy backend disable gh200-a
 mistralrs_proxy backend activate gh200-a
 mistralrs_proxy backend reload
 ```
@@ -177,7 +178,8 @@ There are three operator modes:
 
 - `active`: eligible for new work once readiness and the circuit permit it.
 - `draining`: closed to new assignments while existing work finishes.
-- `disabled`: closed and certified safe to stop.
+- `disabled`: closed; either certified safe to stop by a drain, or closed
+  immediately with `backend disable --force`.
 
 Mode and observed state are deliberately separate. An active backend can, for
 example, have state `checking`, `unready`, `unreachable`, `circuit-open`,
@@ -196,6 +198,15 @@ Use `--no-wait` to start a drain and return immediately, or
 detaches from the operation; it does not cancel the durable drain, and status
 remains available from another CLI process. Activation is allowed only after a
 backend is disabled, ready, and telemetry-fresh.
+
+`backend disable` closes a backend immediately without waiting for in-flight
+work and persists the disabled fence. It is the escape hatch for a dead
+backend, whose drain can never observe the fresh idle telemetry samples a
+drain needs to complete. If a drain is already in progress, it completes at
+once and a running `backend drain` client reports `safe to stop`. While the
+proxy still has in-flight requests on the backend, the command refuses unless
+you pass `--force`; with `--force` those requests run to completion (or fail
+on their own) while no new work is assigned.
 
 The commands speak HTTP under `/control`, but only over the private Unix-domain
 socket (created mode `0660`). `/control` is not forwarded or exposed by the

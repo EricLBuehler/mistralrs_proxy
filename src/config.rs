@@ -68,6 +68,15 @@ pub enum BackendCommand {
         #[command(flatten)]
         control: ControlSocket,
     },
+    /// Remove a backend from routing immediately, without waiting for in-flight work.
+    Disable {
+        backend: String,
+        /// Disable even while the proxy still has in-flight requests on the backend.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        control: ControlSocket,
+    },
     /// Re-admit a ready, telemetry-fresh disabled backend.
     Activate {
         backend: String,
@@ -297,6 +306,37 @@ mod tests {
     #[test]
     fn a_subcommand_is_required() {
         assert!(Cli::try_parse_from(["mistralrs_proxy"]).is_err());
+    }
+
+    #[test]
+    fn backend_disable_takes_a_backend_and_an_optional_force_flag() {
+        let cli =
+            Cli::try_parse_from(["mistralrs_proxy", "backend", "disable", "gh200-a"]).unwrap();
+
+        match cli.command {
+            Command::Backend(BackendCommand::Disable {
+                backend, force, ..
+            }) => {
+                assert_eq!(backend, "gh200-a");
+                assert!(!force);
+            }
+            other => panic!("expected backend disable, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "mistralrs_proxy",
+            "backend",
+            "disable",
+            "gh200-a",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Backend(BackendCommand::Disable { force, .. }) => assert!(force),
+            other => panic!("expected backend disable, got {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["mistralrs_proxy", "backend", "disable"]).is_err());
     }
 
     #[test]
