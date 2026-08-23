@@ -380,36 +380,93 @@ async fn wait_for_drain(
 }
 
 fn print_backend_table(backends: &[BackendView]) {
-    println!(
-        "{:<18} {:<10} {:<13} {:>5} {:>9} {:>5} {:>6} {:>9} {:>7} {:>7}",
-        "BACKEND", "MODE", "STATE", "PROXY", "RUN/CAP", "WAIT", "KV%", "TOK/S", "PRESS", "AGE"
+    for line in render_backend_table(backends).lines() {
+        println!("{line}");
+    }
+}
+
+/// Column widths grow with the data instead of being fixed, so no value
+/// (a long age, a large `running/capacity`, ...) can ever push a row out of
+/// alignment. The backend id column stays capped so one odd name cannot
+/// stretch the table.
+fn render_backend_table(backends: &[BackendView]) -> String {
+    const LEFT_ALIGNED_COLUMNS: usize = 3;
+    let headers = [
+        "BACKEND", "MODE", "STATE", "PROXY", "RUN/CAP", "WAIT", "KV%", "TOK/S", "PRESS", "AGE",
+    ];
+    let rows: Vec<Vec<String>> = backends
+        .iter()
+        .map(|backend| {
+            vec![
+                truncate(&backend.id, 24),
+                backend.mode.to_string(),
+                backend.state.to_string(),
+                backend.proxy_active.to_string(),
+                match (backend.running, backend.effective_capacity) {
+                    (Some(running), Some(capacity)) => format!("{running}/{capacity}"),
+                    _ => "-".to_owned(),
+                },
+                optional_count(backend.waiting),
+                backend
+                    .kv_ratio
+                    .map_or_else(|| "-".to_owned(), |ratio| format!("{:.0}", ratio * 100.0)),
+                backend
+                    .token_rate
+                    .map_or_else(|| "-".to_owned(), |rate| format!("{rate:.1}")),
+                backend
+                    .pressure
+                    .map_or_else(|| "-".to_owned(), |pressure| format!("{pressure:.2}")),
+                backend
+                    .metrics_age_ms
+                    .map_or_else(|| "-".to_owned(), format_age),
+            ]
+        })
+        .collect();
+
+    let widths = headers
+        .iter()
+        .enumerate()
+        .map(|(column, header)| {
+            rows.iter()
+                .map(|row| row[column].chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(header.chars().count())
+        })
+        .collect::<Vec<_>>();
+
+    let mut out = String::new();
+    out.push_str(
+        &headers
+            .iter()
+            .enumerate()
+            .map(|(column, header)| {
+                format_cell(header, widths[column], column < LEFT_ALIGNED_COLUMNS)
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
     );
-    for backend in backends {
-        let run_capacity = match (backend.running, backend.effective_capacity) {
-            (Some(running), Some(capacity)) => format!("{running}/{capacity}"),
-            _ => "-".to_owned(),
-        };
-        println!(
-            "{:<18} {:<10} {:<13} {:>5} {:>9} {:>5} {:>6} {:>9} {:>7} {:>7}",
-            truncate(&backend.id, 17),
-            backend.mode,
-            backend.state,
-            backend.proxy_active,
-            run_capacity,
-            optional_count(backend.waiting),
-            backend
-                .kv_ratio
-                .map_or_else(|| "-".to_owned(), |ratio| format!("{:.0}", ratio * 100.0)),
-            backend
-                .token_rate
-                .map_or_else(|| "-".to_owned(), |rate| format!("{rate:.1}")),
-            backend
-                .pressure
-                .map_or_else(|| "-".to_owned(), |pressure| format!("{pressure:.2}")),
-            backend
-                .metrics_age_ms
-                .map_or_else(|| "-".to_owned(), format_age),
+    out.push('\n');
+    for row in &rows {
+        out.push_str(
+            &row.iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    format_cell(cell, widths[column], column < LEFT_ALIGNED_COLUMNS)
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
         );
+        out.push('\n');
+    }
+    out
+}
+
+fn format_cell(cell: &str, width: usize, left_aligned: bool) -> String {
+    if left_aligned {
+        format!("{cell:<width$}")
+    } else {
+        format!("{cell:>width$}")
     }
 }
 
@@ -474,11 +531,23 @@ fn format_elapsed(ms: u64) -> String {
     format!("{:02}:{:02}", ms / 60_000, (ms % 60_000) / 1_000)
 }
 
+/// Ages stay in a bounded width so the table's AGE column never grows:
+/// `12.3s`, `123s`, `614m`, `25h`, then `12d 4h`. A permanently dead
+/// backend's metrics age keeps growing forever, so the last tier must not
+/// fall back to raw seconds.
 fn format_age(ms: u64) -> String {
-    if ms < 1_000 {
+    if ms < 60_000 {
         format!("{:.1}s", ms as f64 / 1_000.0)
+    } else if ms < 3_600_000 {
+        format!("{:.0}s", ms / 1_000)
+    } else if ms < 86_400_000 {
+        format!("{:.0}m", ms / 60_000)
+    } else if ms < 604_800_000 {
+        format!("{:.0}h", ms / 3_600_000)
     } else {
-        format!("{:.0}s", ms as f64 / 1_000.0)
+        let days = ms / 86_400_000;
+        let hours = (ms % 86_400_000) / 3_600_000;
+        format!("{days}d {hours}h")
     }
 }
 
@@ -491,4 +560,98 @@ fn truncate(value: &str, width: usize) -> String {
         .take(width.saturating_sub(1))
         .collect::<String>()
         + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        backend::BackendMode,
+        routing::{BackendDisplayState, CircuitState, ReadinessState, TelemetryState},
+    };
+
+    fn view(id: &str) -> BackendView {
+        BackendView {
+            id: id.to_owned(),
+            url: "http://127.0.0.1:1".to_owned(),
+            mode: BackendMode::Active,
+            state: BackendDisplayState::Ready,
+            readiness: ReadinessState::Ready,
+            telemetry: TelemetryState::Fresh,
+            circuit: CircuitState::Closed,
+            eligible: true,
+            proxy_active: 0,
+            oldest_proxy_request_ms: None,
+            running: None,
+            waiting: None,
+            reported_capacity: None,
+            configured_capacity: None,
+            effective_capacity: None,
+            capacity_mismatch: false,
+            kv_ratio: None,
+            token_rate: None,
+            pressure: None,
+            metrics_age_ms: None,
+            readiness_age_ms: None,
+            metrics_error: None,
+            readiness_error: None,
+        }
+    }
+
+    #[test]
+    fn format_age_stays_bounded_no_matter_how_old() {
+        assert_eq!(format_age(400), "0.4s");
+        assert_eq!(format_age(12_300), "12.3s");
+        assert_eq!(format_age(123_000), "123s");
+        assert_eq!(format_age(36_843_000), "614m");
+        assert_eq!(format_age(90_000_000), "25h");
+        assert_eq!(format_age(12 * 86_400_000u64 + 4 * 3_600_000u64), "12d 4h");
+
+        // A permanently dead backend ages forever; the string must not.
+        for days in [8u64, 365, 3650] {
+            let rendered = format_age(days * 86_400_000u64);
+            assert!(rendered.chars().count() <= 8, "{rendered} is too wide");
+        }
+    }
+
+    #[test]
+    fn table_rows_stay_aligned_when_values_outgrow_typical_widths() {
+        let mut busy = view("gh200-prod-1");
+        busy.mode = BackendMode::Draining;
+        busy.state = BackendDisplayState::Draining;
+        busy.proxy_active = 12_345;
+        busy.running = Some(10_000u64);
+        busy.effective_capacity = Some(10_000u64);
+        busy.waiting = Some(999u64);
+        busy.kv_ratio = Some(1.0);
+        busy.token_rate = Some(1_234_567.8);
+        busy.pressure = Some(12_345.67);
+        busy.metrics_age_ms = Some(12 * 86_400_000u64 + 4 * 3_600_000u64);
+
+        let table = render_backend_table(&[busy, view("dev-gh200")]);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        let width = lines[0].chars().count();
+        for line in &lines {
+            assert_eq!(line.chars().count(), width, "misaligned row:\n{table}");
+        }
+        assert!(table.contains("10000/10000"), "{table}");
+        assert!(table.contains("12d 4h"), "{table}");
+        assert!(table.contains("1234567.8"), "{table}");
+    }
+
+    #[test]
+    fn long_backend_ids_are_capped() {
+        let long = view(&"x".repeat(60));
+        let table = render_backend_table(std::slice::from_ref(&long));
+        let mut lines = table.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+
+        assert_eq!(row.chars().count(), header.chars().count(), "{table}");
+        let id_cell = row.split(' ').next().unwrap();
+        assert_eq!(id_cell.chars().count(), 24, "{id_cell}");
+        assert!(id_cell.ends_with('…'), "{id_cell}");
+    }
 }

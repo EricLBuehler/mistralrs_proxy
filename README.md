@@ -171,8 +171,9 @@ mistralrs_proxy backend reload
 running/capacity and waiting counts, KV use, token rate, pressure, and metric
 age. Use `list --json` or `status --json` for automation. Every backend command
 accepts `--control-socket`; it must match the server's socket. In `manage`, use
-`↑`/`↓` to select, `d` to drain with confirmation, `a` to activate, `r` to
-reload `runtime.toml`, `R` to refresh immediately, and `q` to quit.
+`↑`/`↓` to select, `d` to drain with confirmation, `D` to force-disable with
+confirmation, `a` to activate, `r` to reload `runtime.toml`, `R` to refresh
+immediately, `?` to list every key, and `q` to quit.
 
 There are three operator modes:
 

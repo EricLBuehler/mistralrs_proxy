@@ -9,7 +9,7 @@ use std::{
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout, Margin},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
@@ -42,12 +42,14 @@ pub async fn manage(client: ControlClient) -> Result<(), Box<dyn Error>> {
 enum Mode {
     Browse,
     ConfirmDrain,
+    ConfirmDisable,
 }
 
 struct App {
     response: BackendListResponse,
     selected: usize,
     mode: Mode,
+    show_help: bool,
     status: String,
     last_refresh: Instant,
     quit: bool,
@@ -63,6 +65,7 @@ impl App {
             response,
             selected: 0,
             mode: Mode::Browse,
+            show_help: false,
             last_refresh: Instant::now(),
             quit: false,
         }
@@ -96,6 +99,16 @@ impl App {
     }
 
     async fn handle(&mut self, code: KeyCode, client: &ControlClient) {
+        if self.show_help {
+            match code {
+                KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => {
+                    self.show_help = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.mode == Mode::ConfirmDrain {
             if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 self.mode = Mode::Browse;
@@ -103,6 +116,17 @@ impl App {
             } else {
                 self.mode = Mode::Browse;
                 self.status = "Drain cancelled.".to_owned();
+            }
+            return;
+        }
+
+        if self.mode == Mode::ConfirmDisable {
+            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.mode = Mode::Browse;
+                self.force_disable(client).await;
+            } else {
+                self.mode = Mode::Browse;
+                self.status = "Force-disable cancelled.".to_owned();
             }
             return;
         }
@@ -133,6 +157,23 @@ impl App {
                 }
                 None => {}
             },
+            KeyCode::Char('D') => match self
+                .selected_backend()
+                .map(|backend| (backend.id.clone(), backend.mode))
+            {
+                Some((id, BackendMode::Disabled)) => {
+                    self.status = format!("{id} is already disabled.");
+                }
+                Some((id, _)) => {
+                    self.mode = Mode::ConfirmDisable;
+                    self.status = format!(
+                        "Force-disable {}? In-flight requests are not waited for. y / n",
+                        id
+                    );
+                }
+                None => {}
+            },
+            KeyCode::Char('?') => self.show_help = !self.show_help,
             KeyCode::Char('a') => self.activate(client).await,
             KeyCode::Char('r') => self.reload(client).await,
             KeyCode::Char('R') => self.refresh(client, true).await,
@@ -158,6 +199,19 @@ impl App {
                 self.refresh(client, false).await;
             }
             Err(error) => self.status = format!("Could not drain {id}: {error}"),
+        }
+    }
+
+    async fn force_disable(&mut self, client: &ControlClient) {
+        let Some(id) = self.selected_backend().map(|backend| backend.id.clone()) else {
+            return;
+        };
+        match client.disable(&id, true).await {
+            Ok(response) => {
+                self.status = format!("{id}: {}", response.message);
+                self.refresh(client, false).await;
+            }
+            Err(error) => self.status = format!("Could not disable {id}: {error}"),
         }
     }
 
@@ -351,10 +405,14 @@ impl App {
 
         let help_text = if self.mode == Mode::ConfirmDrain {
             "Drain selected backend? y / n"
+        } else if self.mode == Mode::ConfirmDisable {
+            "Force-disable selected backend? y / n"
+        } else if self.show_help {
+            "Press ?, q, or Esc to close help"
         } else {
-            "↑/↓ move   d drain   a activate   r reload runtime   R refresh   q quit"
+            "↑/↓ move   d drain   D force-disable   a activate   r reload runtime   R refresh   ? help   q quit"
         };
-        let help_style = if self.mode == Mode::ConfirmDrain {
+        let help_style = if self.mode == Mode::ConfirmDrain || self.mode == Mode::ConfirmDisable {
             Style::default().fg(Color::Black).bg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -372,6 +430,50 @@ impl App {
                 .wrap(Wrap { trim: true }),
             status,
         );
+
+        if self.show_help {
+            self.draw_help_overlay(frame);
+        }
+    }
+
+    fn draw_help_overlay(&self, frame: &mut Frame) {
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).min(56);
+        let height = area.height.saturating_sub(4).min(14);
+        let overlay = Rect::new(
+            area.x + (area.width.saturating_sub(width)) / 2,
+            area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        );
+        let rows = [
+            ("j / ↓", "move down"),
+            ("k / ↑", "move up"),
+            ("Home / End", "first / last backend"),
+            ("d", "drain: stop new work, wait for idle"),
+            ("D", "force-disable: skip the idle wait"),
+            ("a", "activate a disabled backend"),
+            ("r", "reload runtime.toml"),
+            ("R", "refresh now"),
+            ("?", "toggle this help"),
+            ("q / Esc", "quit"),
+        ];
+        let table = Table::new(
+            rows.into_iter().map(|(key, action)| {
+                Row::new(vec![
+                    Cell::from(key.to_owned()).style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(action.to_owned()),
+                ])
+            }),
+            [Constraint::Length(14), Constraint::Min(12)],
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" keys · ? to close ")
+                .style(Style::default().bg(Color::Gray).fg(Color::Black)),
+        );
+        frame.render_widget(table, overlay);
     }
 }
 
@@ -398,10 +500,18 @@ fn age(value: Option<u64>) -> String {
     value.map_or_else(
         || "-".to_owned(),
         |ms| {
-            if ms < 1_000 {
+            if ms < 60_000 {
                 format!("{:.1}s", ms as f64 / 1_000.0)
+            } else if ms < 3_600_000 {
+                format!("{:.0}s", ms / 1_000)
+            } else if ms < 86_400_000 {
+                format!("{:.0}m", ms / 60_000)
+            } else if ms < 604_800_000 {
+                format!("{:.0}h", ms / 3_600_000)
             } else {
-                format!("{:.0}s", ms as f64 / 1_000.0)
+                let days = ms / 86_400_000;
+                let hours = (ms % 86_400_000) / 3_600_000;
+                format!("{days}d {hours}h")
             }
         },
     )
@@ -478,5 +588,53 @@ mod tests {
         let screen = terminal.backend().to_string();
 
         assert!(screen.contains("Drain selected backend? y / n"), "{screen}");
+    }
+
+    #[test]
+    fn help_overlay_lists_every_binding() {
+        let mut app = app();
+        app.show_help = true;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        for needle in [
+            "keys",
+            "drain: stop new work",
+            "force-disable: skip the idle wait",
+            "activate a disabled backend",
+            "reload runtime.toml",
+            "refresh now",
+            "quit",
+        ] {
+            assert!(screen.contains(needle), "{needle} missing from: {screen}");
+        }
+    }
+
+    #[tokio::test]
+    async fn d_key_confirms_and_help_swallows_other_keys() {
+        use crate::backend_cli::ControlClient;
+
+        let client = ControlClient::new("/nonexistent.sock");
+        let mut app = app();
+
+        app.handle(KeyCode::Char('D'), &client).await;
+        assert_eq!(app.mode, Mode::ConfirmDisable);
+        assert!(app.status.contains("Force-disable"));
+
+        app.handle(KeyCode::Char('n'), &client).await;
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.status, "Force-disable cancelled.");
+
+        app.handle(KeyCode::Char('?'), &client).await;
+        assert!(app.show_help);
+        // While help is open, other keys are ignored.
+        app.handle(KeyCode::Char('D'), &client).await;
+        assert!(app.show_help);
+        assert_eq!(app.mode, Mode::Browse);
+        app.handle(KeyCode::Esc, &client).await;
+        assert!(!app.show_help);
     }
 }

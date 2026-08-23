@@ -737,7 +737,10 @@ async fn disable_backend(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<DisableQuery>,
 ) -> Result<Json<ActionResponse>, ControlError> {
-    state.disable(&id, query.force.unwrap_or(false)).await.map(Json)
+    state
+        .disable(&id, query.force.unwrap_or(false))
+        .await
+        .map(Json)
 }
 
 async fn reload_runtime(

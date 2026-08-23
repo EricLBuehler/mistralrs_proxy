@@ -314,9 +314,7 @@ mod tests {
             Cli::try_parse_from(["mistralrs_proxy", "backend", "disable", "gh200-a"]).unwrap();
 
         match cli.command {
-            Command::Backend(BackendCommand::Disable {
-                backend, force, ..
-            }) => {
+            Command::Backend(BackendCommand::Disable { backend, force, .. }) => {
                 assert_eq!(backend, "gh200-a");
                 assert!(!force);
             }
