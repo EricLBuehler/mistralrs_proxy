@@ -323,6 +323,8 @@ impl App {
                 Cell::from(optional_count(backend.waiting)),
                 Cell::from(percent(backend.kv_ratio)),
                 Cell::from(decimal(backend.token_rate, 1)),
+                Cell::from(decimal(backend.prefill_token_rate, 1)),
+                Cell::from(decimal(backend.decode_token_rate, 1)),
                 Cell::from(decimal(backend.pressure, 2)),
                 Cell::from(age(backend.metrics_age_ms)),
             ])
@@ -332,21 +334,23 @@ impl App {
             rows,
             [
                 Constraint::Length(18),
-                Constraint::Length(10),
-                Constraint::Length(13),
+                Constraint::Length(8),
+                Constraint::Length(12),
                 Constraint::Length(7),
                 Constraint::Length(9),
                 Constraint::Length(6),
                 Constraint::Length(6),
+                Constraint::Length(8),
                 Constraint::Length(9),
+                Constraint::Length(10),
                 Constraint::Length(7),
                 Constraint::Min(7),
             ],
         )
         .header(
             Row::new([
-                "BACKEND", "MODE", "STATE", "PROXY", "RUN/CAP", "WAIT", "KV%", "TOK/S", "PRESS",
-                "AGE",
+                "BACKEND", "MODE", "STATE", "PROXY", "RUN/CAP", "WAIT", "KV%", "TOK/S",
+                "PREF T/S", "DECODE T/S", "PRESS", "AGE",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
         )
@@ -369,7 +373,7 @@ impl App {
             || "No configured backends.".to_owned(),
             |backend| {
                 format!(
-                    "{}\nURL: {}\nreadiness: {} ({})   telemetry: {} ({})   circuit: {}\nproxy active: {}   oldest: {}   engine: {} running / {} waiting / {} capacity\nKV: {}   tokens/s: {}   pressure: {}\n{}{}",
+                    "{}\nURL: {}\nreadiness: {} ({})   telemetry: {} ({})   circuit: {}\nproxy active: {}   oldest: {}   engine: {} running / {} waiting / {} capacity\nKV: {}   prefill: {}/s   decode: {}/s   tokens/s: {}   pressure: {}\n{}{}",
                     backend.id,
                     backend.url,
                     backend.readiness,
@@ -383,6 +387,8 @@ impl App {
                     optional_count(backend.waiting),
                     optional_count(backend.effective_capacity),
                     percent(backend.kv_ratio),
+                    decimal(backend.prefill_token_rate, 1),
+                    decimal(backend.decode_token_rate, 1),
                     decimal(backend.token_rate, 1),
                     decimal(backend.pressure, 3),
                     backend
@@ -545,6 +551,8 @@ mod tests {
             capacity_mismatch: false,
             kv_ratio: Some(0.42),
             token_rate: Some(123.4),
+            prefill_token_rate: Some(400.0),
+            decode_token_rate: Some(834.5),
             pressure: Some(0.5),
             metrics_age_ms: Some(100),
             readiness_age_ms: Some(200),
@@ -574,6 +582,10 @@ mod tests {
         assert!(screen.contains("RUN/CAP"), "{screen}");
         assert!(screen.contains("3/8"), "{screen}");
         assert!(screen.contains("42%"), "{screen}");
+        assert!(screen.contains("PREF T/S"), "{screen}");
+        assert!(screen.contains("DECODE T/S"), "{screen}");
+        assert!(screen.contains("400.0"), "{screen}");
+        assert!(screen.contains("834.5"), "{screen}");
         assert!(screen.contains("closed"), "{screen}");
     }
 

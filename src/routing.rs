@@ -174,6 +174,10 @@ struct LiveBackend {
     engine_idle_streak: u64,
     token_rate: Option<f64>,
     previous_token_counter: Option<(f64, Instant)>,
+    prefill_token_rate: Option<f64>,
+    previous_prefill_counter: Option<(f64, Instant)>,
+    decode_token_rate: Option<f64>,
+    previous_decode_counter: Option<(f64, Instant)>,
     circuit: Circuit,
     circuit_epoch: u64,
     consecutive_request_failures: u32,
@@ -197,6 +201,10 @@ impl LiveBackend {
             engine_idle_streak: 0,
             token_rate: None,
             previous_token_counter: None,
+            prefill_token_rate: None,
+            previous_prefill_counter: None,
+            decode_token_rate: None,
+            previous_decode_counter: None,
             circuit: Circuit::Closed,
             circuit_epoch: 0,
             consecutive_request_failures: 0,
@@ -326,6 +334,8 @@ pub struct BackendStatusSnapshot {
     pub capacity_mismatch: bool,
     pub kv_ratio: Option<f64>,
     pub token_rate: Option<f64>,
+    pub prefill_token_rate: Option<f64>,
+    pub decode_token_rate: Option<f64>,
     pub pressure: Option<f64>,
     pub metrics_age_ms: Option<u64>,
     pub metrics_generation: u64,
@@ -536,23 +546,27 @@ impl RoutingState {
             return;
         }
         if let Some(tokens) = metrics.tokens_processed_total {
-            if let Some((previous, at)) = live.previous_token_counter {
-                let elapsed = now.saturating_duration_since(at).as_secs_f64();
-                let delta = if tokens >= previous {
-                    tokens - previous
-                } else {
-                    // Counter reset after a backend restart.
-                    tokens
-                };
-                if elapsed > 0.0 {
-                    let instant_rate = delta / elapsed;
-                    live.token_rate = Some(match live.token_rate {
-                        Some(old) => old * 0.8 + instant_rate * 0.2,
-                        None => instant_rate,
-                    });
-                }
-            }
+            live.token_rate =
+                counter_rate(tokens, live.previous_token_counter, now, live.token_rate);
             live.previous_token_counter = Some((tokens, now));
+        }
+        if let Some(tokens) = metrics.prefill_tokens_processed_total {
+            live.prefill_token_rate = counter_rate(
+                tokens,
+                live.previous_prefill_counter,
+                now,
+                live.prefill_token_rate,
+            );
+            live.previous_prefill_counter = Some((tokens, now));
+        }
+        if let Some(tokens) = metrics.decode_tokens_processed_total {
+            live.decode_token_rate = counter_rate(
+                tokens,
+                live.previous_decode_counter,
+                now,
+                live.decode_token_rate,
+            );
+            live.previous_decode_counter = Some((tokens, now));
         }
         let engine_idle = metrics.sequences_running == 0 && metrics.sequences_waiting == 0;
         live.metrics = Some(MetricsObservation {
@@ -985,6 +999,8 @@ fn status_snapshot(
             .is_some_and(|(reported, configured)| reported != configured),
         kv_ratio: observation.and_then(|sample| sample.metrics.kv_cache_ratio()),
         token_rate: live.token_rate,
+        prefill_token_rate: live.prefill_token_rate,
+        decode_token_rate: live.decode_token_rate,
         pressure,
         metrics_age_ms: observation
             .map(|sample| duration_ms(now.saturating_duration_since(sample.observed_at))),
@@ -998,6 +1014,34 @@ fn status_snapshot(
         metrics_error: live.metrics_error.clone(),
         readiness_error: live.readiness_error.clone(),
     }
+}
+
+/// Exponential moving average of a cumulative counter observed across
+/// scrapes. The first observation after startup has no baseline and yields
+/// `None`. A backwards jump means the backend restarted and the delta is
+/// re-anchored at the counter's new value.
+fn counter_rate(
+    current: f64,
+    previous: Option<(f64, Instant)>,
+    now: Instant,
+    old_rate: Option<f64>,
+) -> Option<f64> {
+    let (previous_value, at) = previous?;
+    let elapsed = now.saturating_duration_since(at).as_secs_f64();
+    if elapsed <= 0.0 {
+        return old_rate;
+    }
+    let delta = if current >= previous_value {
+        current - previous_value
+    } else {
+        // Counter reset after a backend restart.
+        current
+    };
+    let instant_rate = delta / elapsed;
+    Some(match old_rate {
+        Some(old) => old * 0.8 + instant_rate * 0.2,
+        None => instant_rate,
+    })
 }
 
 fn display_state(
@@ -1261,6 +1305,8 @@ mod tests {
             sequences_capacity: Some(capacity),
             kv_cache: kv.map(|(used, total)| crate::telemetry::KvCacheMetrics { used, total }),
             tokens_processed_total: None,
+            prefill_tokens_processed_total: None,
+            decode_tokens_processed_total: None,
             sequences_completed_total: None,
         }
     }
@@ -1268,6 +1314,66 @@ mod tests {
     fn ready(state: &RoutingState, id: &str) {
         state.record_readiness_success(id);
         state.record_readiness_success(id);
+    }
+
+    #[test]
+    fn counter_rate_smooths_and_reanchors_after_reset() {
+        let at = Instant::now();
+        // First observation has no baseline yet.
+        assert_eq!(counter_rate(100.0, None, at, None), None);
+
+        let after = at + Duration::from_secs(10);
+        // 100 tokens over 10s = 10 t/s.
+        assert_eq!(
+            counter_rate(100.0, Some((0.0, at)), after, None),
+            Some(10.0)
+        );
+
+        // 100 more over 10s keeps the smoothed rate at 10 t/s.
+        let later = after + Duration::from_secs(10);
+        assert_eq!(
+            counter_rate(200.0, Some((100.0, after)), later, Some(10.0)),
+            Some(10.0)
+        );
+
+        // A backwards jump is a restart: 5 tokens over 10s = 0.5 t/s,
+        // blended 0.8 * 10 + 0.2 * 0.5.
+        assert_eq!(
+            counter_rate(5.0, Some((200.0, after)), later, Some(10.0)),
+            Some(10.0 * 0.8 + 0.5 * 0.2)
+        );
+    }
+
+    #[test]
+    fn phase_counters_yield_separate_prefill_and_decode_rates() {
+        let runtime = runtime();
+        let routing = RoutingState::new(runtime);
+        ready(&routing, "a");
+        ready(&routing, "a");
+
+        let phase = |total: f64, prefill: f64, decode: f64| {
+            let mut m = metrics(1, 0, 32, None);
+            m.tokens_processed_total = Some(total);
+            m.prefill_tokens_processed_total = Some(prefill);
+            m.decode_tokens_processed_total = Some(decode);
+            m
+        };
+
+        // First observation anchors the counters; the second yields rates.
+        routing.record_metrics_success("a", phase(0.0, 0.0, 0.0));
+        std::thread::sleep(Duration::from_millis(50));
+        routing.record_metrics_success("a", phase(100.0, 60.0, 40.0));
+
+        let status = routing.status("a").unwrap();
+        let total = status.token_rate.expect("combined rate should exist");
+        let prefill = status.prefill_token_rate.expect("prefill rate should exist");
+        let decode = status.decode_token_rate.expect("decode rate should exist");
+
+        // The phase split must reconcile with the combined counter.
+        assert!((total - (prefill + decode)).abs() < 1e-9);
+        // 60 of the 100 tokens were prefill.
+        assert!((prefill / total - 0.6).abs() < 1e-9);
+        assert!((decode / total - 0.4).abs() < 1e-9);
     }
 
     #[test]

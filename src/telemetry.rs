@@ -13,6 +13,8 @@ pub const SEQUENCES_CAPACITY_METRIC: &str = "mistralrs_sequences_capacity";
 pub const KV_CACHE_BLOCKS_USED_METRIC: &str = "mistralrs_kv_cache_blocks_used";
 pub const KV_CACHE_BLOCKS_TOTAL_METRIC: &str = "mistralrs_kv_cache_blocks_total";
 pub const TOKENS_PROCESSED_TOTAL_METRIC: &str = "mistralrs_tokens_processed_total";
+pub const PREFILL_TOKENS_PROCESSED_TOTAL_METRIC: &str = "mistralrs_prefill_tokens_processed_total";
+pub const DECODE_TOKENS_PROCESSED_TOTAL_METRIC: &str = "mistralrs_decode_tokens_processed_total";
 pub const SEQUENCES_COMPLETED_TOTAL_METRIC: &str = "mistralrs_sequences_completed_total";
 
 pub const KV_PENALTY_START: f64 = 0.85;
@@ -54,6 +56,10 @@ pub struct MistralRsMetrics {
     /// Best-effort cumulative counters. Invalid optional samples are omitted
     /// without invalidating the routing gauges.
     pub tokens_processed_total: Option<f64>,
+    /// Phase split of the combined counter. Older engines omit both, so they
+    /// are absent together; the combined total remains the routing signal.
+    pub prefill_tokens_processed_total: Option<f64>,
+    pub decode_tokens_processed_total: Option<f64>,
     pub sequences_completed_total: Option<f64>,
 }
 
@@ -349,6 +355,8 @@ pub fn parse_mistralrs_metrics(input: &str) -> Result<MistralRsMetrics, MetricsP
     let mut kv_used = RequiredGauge::new(KV_CACHE_BLOCKS_USED_METRIC, false);
     let mut kv_total = RequiredGauge::new(KV_CACHE_BLOCKS_TOTAL_METRIC, true);
     let mut tokens = OptionalSingleCounter::default();
+    let mut prefill_tokens = OptionalSingleCounter::default();
+    let mut decode_tokens = OptionalSingleCounter::default();
     let mut completions = OptionalCounterFamily::default();
 
     for (line_index, raw_line) in input.lines().enumerate() {
@@ -370,6 +378,14 @@ pub fn parse_mistralrs_metrics(input: &str) -> Result<MistralRsMetrics, MetricsP
                     tokens.invalidate();
                     continue;
                 }
+                if metric == PREFILL_TOKENS_PROCESSED_TOTAL_METRIC {
+                    prefill_tokens.invalidate();
+                    continue;
+                }
+                if metric == DECODE_TOKENS_PROCESSED_TOTAL_METRIC {
+                    decode_tokens.invalidate();
+                    continue;
+                }
                 if metric == SEQUENCES_COMPLETED_TOTAL_METRIC {
                     completions.invalidate();
                     continue;
@@ -389,6 +405,8 @@ pub fn parse_mistralrs_metrics(input: &str) -> Result<MistralRsMetrics, MetricsP
             KV_CACHE_BLOCKS_USED_METRIC => kv_used.observe(sample, line_number)?,
             KV_CACHE_BLOCKS_TOTAL_METRIC => kv_total.observe(sample, line_number)?,
             TOKENS_PROCESSED_TOTAL_METRIC => tokens.observe(sample),
+            PREFILL_TOKENS_PROCESSED_TOTAL_METRIC => prefill_tokens.observe(sample),
+            DECODE_TOKENS_PROCESSED_TOTAL_METRIC => decode_tokens.observe(sample),
             SEQUENCES_COMPLETED_TOTAL_METRIC => completions.observe(sample),
             _ => unreachable!("recognized metric changed while parsing"),
         }
@@ -418,6 +436,8 @@ pub fn parse_mistralrs_metrics(input: &str) -> Result<MistralRsMetrics, MetricsP
         sequences_capacity,
         kv_cache,
         tokens_processed_total: tokens.finish(),
+        prefill_tokens_processed_total: prefill_tokens.finish(),
+        decode_tokens_processed_total: decode_tokens.finish(),
         sequences_completed_total: completions.finish(),
     })
 }
@@ -568,6 +588,8 @@ fn is_recognized_metric(metric: &str) -> bool {
             | KV_CACHE_BLOCKS_USED_METRIC
             | KV_CACHE_BLOCKS_TOTAL_METRIC
             | TOKENS_PROCESSED_TOTAL_METRIC
+            | PREFILL_TOKENS_PROCESSED_TOTAL_METRIC
+            | DECODE_TOKENS_PROCESSED_TOTAL_METRIC
             | SEQUENCES_COMPLETED_TOTAL_METRIC
     )
 }
@@ -580,6 +602,8 @@ fn static_metric_name(metric: &str) -> &'static str {
         KV_CACHE_BLOCKS_USED_METRIC => KV_CACHE_BLOCKS_USED_METRIC,
         KV_CACHE_BLOCKS_TOTAL_METRIC => KV_CACHE_BLOCKS_TOTAL_METRIC,
         TOKENS_PROCESSED_TOTAL_METRIC => TOKENS_PROCESSED_TOTAL_METRIC,
+        PREFILL_TOKENS_PROCESSED_TOTAL_METRIC => PREFILL_TOKENS_PROCESSED_TOTAL_METRIC,
+        DECODE_TOKENS_PROCESSED_TOTAL_METRIC => DECODE_TOKENS_PROCESSED_TOTAL_METRIC,
         SEQUENCES_COMPLETED_TOTAL_METRIC => SEQUENCES_COMPLETED_TOTAL_METRIC,
         _ => unreachable!("metric was checked before conversion"),
     }
@@ -604,6 +628,8 @@ mistralrs_kv_cache_blocks_total 100
         let metrics = parse_mistralrs_metrics(&format!(
             "{BASE}\n\
              mistralrs_tokens_processed_total 1234\n\
+             mistralrs_prefill_tokens_processed_total 900\n\
+             mistralrs_decode_tokens_processed_total 334\n\
              mistralrs_sequences_completed_total{{reason=\"stop\"}} 8\n\
              mistralrs_sequences_completed_total{{reason=\"error\"}} 2\n"
         ))
@@ -620,7 +646,17 @@ mistralrs_kv_cache_blocks_total 100
             })
         );
         assert_eq!(metrics.tokens_processed_total, Some(1234.0));
+        assert_eq!(metrics.prefill_tokens_processed_total, Some(900.0));
+        assert_eq!(metrics.decode_tokens_processed_total, Some(334.0));
         assert_eq!(metrics.sequences_completed_total, Some(10.0));
+    }
+
+    #[test]
+    fn older_engines_without_the_phase_split_parse_cleanly() {
+        let metrics = parse_mistralrs_metrics(BASE).unwrap();
+
+        assert_eq!(metrics.prefill_tokens_processed_total, None);
+        assert_eq!(metrics.decode_tokens_processed_total, None);
     }
 
     #[test]
@@ -794,11 +830,15 @@ mistralrs_kv_cache_blocks_total 100
         let input = format!(
             "{BASE}\n\
              mistralrs_tokens_processed_total nope\n\
+             mistralrs_prefill_tokens_processed_total -3\n\
+             mistralrs_decode_tokens_processed_total inf\n\
              mistralrs_sequences_completed_total{{reason=\"stop\"}} NaN\n"
         );
         let metrics = parse_mistralrs_metrics(&input).unwrap();
 
         assert_eq!(metrics.tokens_processed_total, None);
+        assert_eq!(metrics.prefill_tokens_processed_total, None);
+        assert_eq!(metrics.decode_tokens_processed_total, None);
         assert_eq!(metrics.sequences_completed_total, None);
     }
 
@@ -808,12 +848,16 @@ mistralrs_kv_cache_blocks_total 100
             "{BASE}\n\
              mistralrs_tokens_processed_total 10\n\
              mistralrs_tokens_processed_total 11\n\
+             mistralrs_prefill_tokens_processed_total 4\n\
+             mistralrs_prefill_tokens_processed_total 5\n\
              mistralrs_sequences_completed_total{{reason=\"stop\"}} 2\n\
              mistralrs_sequences_completed_total{{reason=\"stop\"}} 2\n"
         );
         let metrics = parse_mistralrs_metrics(&input).unwrap();
 
         assert_eq!(metrics.tokens_processed_total, None);
+        assert_eq!(metrics.prefill_tokens_processed_total, None);
+        assert_eq!(metrics.decode_tokens_processed_total, None);
         assert_eq!(metrics.sequences_completed_total, None);
     }
 

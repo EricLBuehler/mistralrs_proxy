@@ -97,6 +97,8 @@ pub struct BackendView {
     pub capacity_mismatch: bool,
     pub kv_ratio: Option<f64>,
     pub token_rate: Option<f64>,
+    pub prefill_token_rate: Option<f64>,
+    pub decode_token_rate: Option<f64>,
     pub pressure: Option<f64>,
     pub metrics_age_ms: Option<u64>,
     pub readiness_age_ms: Option<u64>,
@@ -125,6 +127,8 @@ impl From<BackendStatusSnapshot> for BackendView {
             capacity_mismatch: status.capacity_mismatch,
             kv_ratio: status.kv_ratio,
             token_rate: status.token_rate,
+            prefill_token_rate: status.prefill_token_rate,
+            decode_token_rate: status.decode_token_rate,
             pressure: status.pressure,
             metrics_age_ms: status.metrics_age_ms,
             readiness_age_ms: status.readiness_age_ms,
@@ -872,6 +876,8 @@ mod tests {
             sequences_capacity: Some(32),
             kv_cache: None,
             tokens_processed_total: None,
+            prefill_tokens_processed_total: None,
+            decode_tokens_processed_total: None,
             sequences_completed_total: None,
         }
     }

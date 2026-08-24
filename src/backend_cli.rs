@@ -392,7 +392,8 @@ fn print_backend_table(backends: &[BackendView]) {
 fn render_backend_table(backends: &[BackendView]) -> String {
     const LEFT_ALIGNED_COLUMNS: usize = 3;
     let headers = [
-        "BACKEND", "MODE", "STATE", "PROXY", "RUN/CAP", "WAIT", "KV%", "TOK/S", "PRESS", "AGE",
+        "BACKEND", "MODE", "STATE", "PROXY", "RUN/CAP", "WAIT", "KV%", "TOK/S", "PREF T/S",
+        "DECODE T/S", "PRESS", "AGE",
     ];
     let rows: Vec<Vec<String>> = backends
         .iter()
@@ -412,6 +413,12 @@ fn render_backend_table(backends: &[BackendView]) -> String {
                     .map_or_else(|| "-".to_owned(), |ratio| format!("{:.0}", ratio * 100.0)),
                 backend
                     .token_rate
+                    .map_or_else(|| "-".to_owned(), |rate| format!("{rate:.1}")),
+                backend
+                    .prefill_token_rate
+                    .map_or_else(|| "-".to_owned(), |rate| format!("{rate:.1}")),
+                backend
+                    .decode_token_rate
                     .map_or_else(|| "-".to_owned(), |rate| format!("{rate:.1}")),
                 backend
                     .pressure
@@ -590,6 +597,8 @@ mod tests {
             capacity_mismatch: false,
             kv_ratio: None,
             token_rate: None,
+            prefill_token_rate: None,
+            decode_token_rate: None,
             pressure: None,
             metrics_age_ms: None,
             readiness_age_ms: None,
@@ -625,6 +634,8 @@ mod tests {
         busy.waiting = Some(999u64);
         busy.kv_ratio = Some(1.0);
         busy.token_rate = Some(1_234_567.8);
+        busy.prefill_token_rate = Some(432_100.5);
+        busy.decode_token_rate = Some(802_467.3);
         busy.pressure = Some(12_345.67);
         busy.metrics_age_ms = Some(12 * 86_400_000u64 + 4 * 3_600_000u64);
 
@@ -639,6 +650,8 @@ mod tests {
         assert!(table.contains("10000/10000"), "{table}");
         assert!(table.contains("12d 4h"), "{table}");
         assert!(table.contains("1234567.8"), "{table}");
+        assert!(table.contains("432100.5"), "{table}");
+        assert!(table.contains("802467.3"), "{table}");
     }
 
     #[test]
