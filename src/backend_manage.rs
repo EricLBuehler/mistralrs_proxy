@@ -8,9 +8,8 @@ use std::{
 
 use ratatui::{
     Frame,
-    buffer::Buffer,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
@@ -24,13 +23,11 @@ use crate::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_POLL: Duration = Duration::from_millis(100);
-/// Fixed natural width of the backend table: 2px of highlight-symbol slot,
-/// 12 columns plus 1px of spacing each. Fits unscrolled in a 100-column
+/// Natural width of the backend table: 2px of highlight-symbol slot, 12
+/// columns plus 1px of spacing each. Fits unscrolled in a 100-column
 /// terminal; narrower terminals scroll it with ←/→ so every column stays
 /// reachable, wider terminals stretch the trailing column instead.
 const TABLE_WIDTH: u16 = 98;
-/// ←/→ scroll step in cells.
-const SCROLL_STEP: u16 = 8;
 
 /// Open a terminal UI backed by the running proxy's private control socket.
 pub async fn manage(client: ControlClient) -> Result<(), Box<dyn Error>> {
@@ -150,10 +147,12 @@ impl App {
                     (self.selected + 1).min(self.response.backends.len().saturating_sub(1));
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.table_scroll = self.table_scroll.saturating_sub(SCROLL_STEP);
+                self.table_scroll =
+                    self.table_scroll.saturating_sub(crate::render::SCROLL_STEP);
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.table_scroll = self.table_scroll.saturating_add(SCROLL_STEP);
+                self.table_scroll =
+                    self.table_scroll.saturating_add(crate::render::SCROLL_STEP);
             }
             KeyCode::Home => self.selected = 0,
             KeyCode::End => self.selected = self.response.backends.len().saturating_sub(1),
@@ -382,33 +381,16 @@ impl App {
         )
         .highlight_symbol("> ");
 
-        let visible = table.width.saturating_sub(2);
-        // The table keeps its 98px natural width when the terminal is narrow
-        // (scrolling makes the rest reachable) and stretches to the terminal
-        // when it is wider, so the trailing column absorbs the slack.
-        let table_width = TABLE_WIDTH.max(visible);
-        let scroll = self.table_scroll.min(table_width.saturating_sub(visible));
-
-        let mut offscreen = Buffer::empty(Rect::new(0, 0, table_width, table.height));
         let mut table_state = TableState::default()
             .with_selected((!self.response.backends.is_empty()).then_some(self.selected));
-        ratatui::widgets::StatefulWidget::render(
+        crate::render::render_scrolled_table(
+            frame,
             table_widget,
-            Rect::new(0, 0, table_width, table.height),
-            &mut offscreen,
+            table.inner(Margin::new(1, 0)),
+            TABLE_WIDTH,
+            self.table_scroll,
             &mut table_state,
         );
-
-        let buffer = frame.buffer_mut();
-        for y in 0..table.height {
-            for x in 0..visible {
-                let source = scroll + x;
-                if source >= table_width {
-                    break;
-                }
-                buffer[(table.x + 1 + x, table.y + y)] = offscreen[(source, y)].clone();
-            }
-        }
 
         let details = self.selected_backend().map_or_else(
             || "No configured backends.".to_owned(),

@@ -65,6 +65,7 @@ pub struct LogRecord {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
     pub complete: bool,
     pub termination: String,
     pub error: Option<String>,
@@ -241,6 +242,8 @@ pub struct KeyTotals {
     pub errors: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub prefilled_tokens: u64,
 }
 
 /// Per-endpoint totals.
@@ -250,6 +253,8 @@ pub struct PathTotals {
     pub errors: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub prefilled_tokens: u64,
 }
 
 /// Historical totals and latency distributions for one selected backend.
@@ -259,6 +264,8 @@ pub struct BackendTotals {
     pub errors: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub prefilled_tokens: u64,
     pub queue_ms: Distribution,
     pub first_byte_ms: Distribution,
     pub latency_ms: Distribution,
@@ -270,6 +277,8 @@ struct BackendAccumulator {
     errors: usize,
     input_tokens: u64,
     output_tokens: u64,
+    cached_tokens: u64,
+    prefilled_tokens: u64,
     queues: Vec<u64>,
     first_bytes: Vec<u64>,
     latencies: Vec<u64>,
@@ -282,6 +291,8 @@ impl BackendAccumulator {
             errors: self.errors,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            cached_tokens: self.cached_tokens,
+            prefilled_tokens: self.prefilled_tokens,
             queue_ms: Distribution::from_values(self.queues),
             first_byte_ms: Distribution::from_values(self.first_bytes),
             latency_ms: Distribution::from_values(self.latencies),
@@ -330,6 +341,11 @@ pub struct Summary {
     pub no_status: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens served from the prefix cache instead of recomputed.
+    pub cached_tokens: u64,
+    /// Input tokens that were recomputed: input − cached per request, over the
+    /// requests that reported input tokens.
+    pub prefilled_tokens: u64,
     pub response_bytes: u64,
     pub first_at: Option<String>,
     pub last_at: Option<String>,
@@ -337,6 +353,9 @@ pub struct Summary {
     pub input_tokens_seen: Distribution,
     /// Completion sizes, over the requests that reported usage.
     pub output_tokens_seen: Distribution,
+    /// Per-request share of the prompt served from the prefix cache, 0–100,
+    /// over the requests that reported input tokens.
+    pub cache_hit_pct_seen: Distribution,
     /// Time to the first response byte over streaming responses only, which is
     /// the time to the first generated token. A non-streaming response does not
     /// send its head until generation has finished, so including those would
@@ -355,6 +374,16 @@ pub struct Summary {
     pub by_backend: Vec<(String, BackendTotals)>,
 }
 
+impl Summary {
+    /// Aggregate cache hit rate over the input tokens of the requests that
+    /// reported usage. `None` when no request reported cached tokens, which
+    /// is every log written before engines started reporting the field.
+    pub fn cache_hit_pct(&self) -> Option<f64> {
+        (self.cached_tokens > 0 && self.input_tokens > 0)
+            .then(|| 100.0 * self.cached_tokens as f64 / self.input_tokens as f64)
+    }
+}
+
 pub fn summarize(records: &[LogRecord]) -> Summary {
     let mut summary = Summary {
         requests: records.len(),
@@ -368,6 +397,7 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
     let mut outputs = Vec::new();
     let mut first_tokens = Vec::new();
     let mut per_token = Vec::new();
+    let mut cache_hit_pct = Vec::new();
 
     for record in records {
         if record.authorized {
@@ -397,8 +427,19 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
 
         let input = record.input_tokens.unwrap_or(0);
         let output = record.output_tokens.unwrap_or(0);
+        let cached = record.cached_tokens.unwrap_or(0);
         summary.input_tokens = summary.input_tokens.saturating_add(input);
         summary.output_tokens = summary.output_tokens.saturating_add(output);
+        summary.cached_tokens = summary.cached_tokens.saturating_add(cached);
+        // Prefill is the recompute actually performed: the input minus what
+        // the prefix cache already held.
+        let prefilled = input.saturating_sub(cached);
+        if record.input_tokens.is_some() {
+            summary.prefilled_tokens = summary.prefilled_tokens.saturating_add(prefilled);
+        }
+        if let Some(input) = record.input_tokens.filter(|input| *input > 0) {
+            cache_hit_pct.push(100 * cached / input);
+        }
         summary.response_bytes = summary.response_bytes.saturating_add(record.response_bytes);
         latencies.push(record.duration_ms);
         if let Some(tokens) = record.input_tokens {
@@ -420,12 +461,20 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
         key.errors += usize::from(record.is_error());
         key.input_tokens = key.input_tokens.saturating_add(input);
         key.output_tokens = key.output_tokens.saturating_add(output);
+        key.cached_tokens = key.cached_tokens.saturating_add(cached);
+        if record.input_tokens.is_some() {
+            key.prefilled_tokens = key.prefilled_tokens.saturating_add(prefilled);
+        }
 
         let path = paths.entry(record.path()).or_default();
         path.requests += 1;
         path.errors += usize::from(record.is_error());
         path.input_tokens = path.input_tokens.saturating_add(input);
         path.output_tokens = path.output_tokens.saturating_add(output);
+        path.cached_tokens = path.cached_tokens.saturating_add(cached);
+        if record.input_tokens.is_some() {
+            path.prefilled_tokens = path.prefilled_tokens.saturating_add(prefilled);
+        }
 
         if let Some(backend_id) = record.backend_id.as_deref() {
             let backend = backends.entry(backend_id).or_default();
@@ -433,6 +482,10 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
             backend.errors += usize::from(record.is_error());
             backend.input_tokens = backend.input_tokens.saturating_add(input);
             backend.output_tokens = backend.output_tokens.saturating_add(output);
+            backend.cached_tokens = backend.cached_tokens.saturating_add(cached);
+            if record.input_tokens.is_some() {
+                backend.prefilled_tokens = backend.prefilled_tokens.saturating_add(prefilled);
+            }
             backend.latencies.push(record.duration_ms);
             if let Some(ms) = record.proxy_queue_ms {
                 backend.queues.push(ms);
@@ -457,6 +510,7 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
     summary.latency_ms = Distribution::from_values(latencies);
     summary.input_tokens_seen = Distribution::from_values(inputs);
     summary.output_tokens_seen = Distribution::from_values(outputs);
+    summary.cache_hit_pct_seen = Distribution::from_values(cache_hit_pct);
     summary.first_token_ms = Distribution::from_values(first_tokens);
     summary.per_output_token_us = Distribution::from_values(per_token);
 
@@ -616,6 +670,14 @@ pub fn summary_lines(path: &Path, summary: &Summary, malformed: u64) -> Vec<Stri
         thousands(summary.input_tokens + summary.output_tokens),
     ));
     lines.push(format!(
+        "  cache      {:>10} cached   {} of input   {} prefilled",
+        thousands(summary.cached_tokens),
+        summary
+            .cache_hit_pct()
+            .map_or_else(|| "-".to_owned(), |pct| format!("{pct:.1}%")),
+        thousands(summary.prefilled_tokens),
+    ));
+    lines.push(format!(
         "  shape      {:>10} streaming   {} non-streaming",
         thousands(summary.streaming as u64),
         thousands(summary.non_streaming as u64),
@@ -635,15 +697,17 @@ pub fn summary_lines(path: &Path, summary: &Summary, malformed: u64) -> Vec<Stri
 
     lines.push(String::new());
     lines.push(format!(
-        "  {:<24}{:>10}{:>14}{:>14}{:>9}",
-        "KEY", "REQUESTS", "IN", "OUT", "ERRORS"
+        "  {:<24}{:>10}{:>12}{:>12}{:>12}{:>12}{:>7}",
+        "KEY", "REQUESTS", "IN", "CACHED", "PREFILLED", "OUT", "ERRORS"
     ));
     for (name, totals) in &summary.by_key {
         lines.push(format!(
-            "  {:<24}{:>10}{:>14}{:>14}{:>9}",
+            "  {:<24}{:>10}{:>12}{:>12}{:>12}{:>12}{:>7}",
             truncate(name, 23),
             thousands(totals.requests as u64),
             thousands(totals.input_tokens),
+            thousands(totals.cached_tokens),
+            thousands(totals.prefilled_tokens),
             thousands(totals.output_tokens),
             totals.errors,
         ));
@@ -651,15 +715,17 @@ pub fn summary_lines(path: &Path, summary: &Summary, malformed: u64) -> Vec<Stri
 
     lines.push(String::new());
     lines.push(format!(
-        "  {:<34}{:>10}{:>14}{:>14}",
-        "ENDPOINT", "REQUESTS", "IN", "OUT"
+        "  {:<34}{:>10}{:>12}{:>12}{:>12}{:>12}",
+        "ENDPOINT", "REQUESTS", "IN", "CACHED", "PREFILLED", "OUT"
     ));
     for (path, totals) in &summary.by_path {
         lines.push(format!(
-            "  {:<34}{:>10}{:>14}{:>14}",
+            "  {:<34}{:>10}{:>12}{:>12}{:>12}{:>12}",
             truncate(path, 33),
             thousands(totals.requests as u64),
             thousands(totals.input_tokens),
+            thousands(totals.cached_tokens),
+            thousands(totals.prefilled_tokens),
             thousands(totals.output_tokens),
         ));
     }
@@ -667,8 +733,8 @@ pub fn summary_lines(path: &Path, summary: &Summary, malformed: u64) -> Vec<Stri
     if !summary.by_backend.is_empty() {
         lines.push(String::new());
         lines.push(format!(
-            "  {:<18}{:>10}{:>8}{:>12}{:>12}{:>9}{:>11}{:>11}{:>11}",
-            "BACKEND", "REQUESTS", "SHARE", "IN", "OUT", "ERRORS", "QUEUE95", "TTFB95", "LATENCY95"
+            "  {:<18}{:>10}{:>8}{:>12}{:>12}{:>12}{:>12}{:>9}",
+            "BACKEND", "REQUESTS", "SHARE", "IN", "CACHED", "PREFILLED", "OUT", "ERRORS"
         ));
         let routed: usize = summary
             .by_backend
@@ -682,16 +748,15 @@ pub fn summary_lines(path: &Path, summary: &Summary, malformed: u64) -> Vec<Stri
                 totals.requests as f64 * 100.0 / routed as f64
             };
             lines.push(format!(
-                "  {:<18}{:>10}{:>7.1}%{:>12}{:>12}{:>9}{:>11}{:>11}{:>11}",
+                "  {:<18}{:>10}{:>7.1}%{:>12}{:>12}{:>12}{:>12}{:>9}",
                 truncate(backend, 17),
                 thousands(totals.requests as u64),
                 share,
                 thousands(totals.input_tokens),
+                thousands(totals.cached_tokens),
+                thousands(totals.prefilled_tokens),
                 thousands(totals.output_tokens),
                 totals.errors,
-                distribution_p95(totals.queue_ms),
-                distribution_p95(totals.first_byte_ms),
-                distribution_p95(totals.latency_ms),
             ));
         }
     }
@@ -763,7 +828,7 @@ fn formatted(distribution: Distribution, render: impl Fn(u64) -> String) -> Perc
 /// Token sizes come first because they describe the workload; the per-token
 /// rate is the latency number that does not move with completion length.
 pub fn percentile_rows(summary: &Summary) -> Vec<(&'static str, PercentileRow)> {
-    vec![
+    let mut rows = vec![
         (
             "input tokens",
             formatted(summary.input_tokens_seen, thousands),
@@ -778,7 +843,16 @@ pub fn percentile_rows(summary: &Summary) -> Vec<(&'static str, PercentileRow)> 
             formatted(summary.per_output_token_us, rate),
         ),
         ("total latency", formatted(summary.latency_ms, duration)),
-    ]
+    ];
+    // Only shown once some request actually reported cached tokens, so logs
+    // written by older proxies do not grow a row of misleading zeros.
+    if summary.cached_tokens > 0 {
+        rows.push((
+            "cache hit %",
+            formatted(summary.cache_hit_pct_seen, |pct| format!("{pct}%")),
+        ));
+    }
+    rows
 }
 
 pub(crate) fn truncate(text: &str, width: usize) -> String {
@@ -809,7 +883,7 @@ mod tests {
                     "duration_ms":100,"method":"POST","uri":"/v1/chat/completions?stream=true",
                     "key_name":"alice","key_identifier":"AAAAAAAA","status":200,"authorized":true,
                     "input_tokens":100,"output_tokens":10,"response_bytes":50,"complete":true,
-                    "streaming":true,"time_to_first_byte_ms":40,"termination":"complete"}"#,
+                    "cached_tokens":75,"streaming":true,"time_to_first_byte_ms":40,"termination":"complete"}"#,
             ),
             record(
                 r#"{"request_id":"b","started_at":"2026-08-20T10:00:01.000Z","started_at_unix_ms":200,
@@ -838,6 +912,9 @@ mod tests {
         assert_eq!(summary.client_errors, 1);
         assert_eq!(summary.input_tokens, 120);
         assert_eq!(summary.output_tokens, 15);
+        assert_eq!(summary.cached_tokens, 75);
+        assert_eq!(summary.prefilled_tokens, 45);
+        assert_eq!(summary.cache_hit_pct(), Some(62.5));
         assert_eq!(summary.latency_ms.max, 2000);
         assert_eq!(summary.latency_ms.p50, 300);
         assert_eq!(summary.latency_ms.samples, 3);
@@ -1010,6 +1087,9 @@ mod tests {
         assert!(text.contains("authorized 2   rejected 1"), "{text}");
         assert!(text.contains("2xx 2   3xx 0   4xx 1"), "{text}");
         assert!(text.contains("120 in   15 out   135 total"), "{text}");
+        assert!(text.contains("75 cached"), "{text}");
+        assert!(text.contains("62.5% of input"), "{text}");
+        assert!(text.contains("45 prefilled"), "{text}");
         assert!(text.contains("P50"), "{text}");
         assert!(text.contains("total latency"), "{text}");
         assert!(text.contains("per output token"), "{text}");
@@ -1054,6 +1134,46 @@ mod tests {
 
         // Latency, by contrast, is known for every request.
         assert_eq!(summary.latency_ms.samples, 3);
+    }
+
+    #[test]
+    fn cache_stats_are_absent_when_no_request_reports_cached_tokens() {
+        // Records without the field are what every pre-existing log contains.
+        let summary = summarize(&[record(
+            r#"{"request_id":"a","started_at":"2026-08-20T10:00:00.000Z",
+                "started_at_unix_ms":100,"duration_ms":100,"method":"POST",
+                "uri":"/v1/chat/completions","key_name":"alice",
+                "key_identifier":"AAAAAAAA","status":200,"authorized":true,
+                "input_tokens":100,"output_tokens":10,"complete":true,
+                "termination":"complete"}"#,
+        )]);
+
+        assert_eq!(summary.cached_tokens, 0);
+        assert_eq!(summary.prefilled_tokens, 100);
+        assert_eq!(summary.cache_hit_pct(), None);
+        assert!(
+            percentile_rows(&summary)
+                .iter()
+                .all(|(name, _)| *name != "cache hit %"),
+            "no cache row for a log without the field"
+        );
+
+        // The row appears as soon as any request reports cached tokens.
+        let summary = summarize(&[record(
+            r#"{"request_id":"a","started_at":"2026-08-20T10:00:00.000Z",
+                "started_at_unix_ms":100,"duration_ms":100,"method":"POST",
+                "uri":"/v1/chat/completions","key_name":"alice",
+                "key_identifier":"AAAAAAAA","status":200,"authorized":true,
+                "input_tokens":100,"output_tokens":10,"complete":true,
+                "cached_tokens":40,"termination":"complete"}"#,
+        )]);
+        assert_eq!(summary.cache_hit_pct(), Some(40.0));
+        assert!(
+            percentile_rows(&summary)
+                .iter()
+                .any(|(name, _)| *name == "cache hit %"),
+            "cache row present once cached tokens are reported"
+        );
     }
 
     #[test]

@@ -135,6 +135,10 @@ pub enum KeyCommand {
     },
     /// Open the interactive key manager.
     Manage {
+        /// Audit log for the per-key token usage panel.
+        #[arg(long, env = "LOG_FILE", default_value = "proxy.jsonl")]
+        log_file: PathBuf,
+
         #[command(flatten)]
         keys: KeysFile,
     },
@@ -275,8 +279,9 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Command::Key(KeyCommand::Manage { keys }) => {
+            Command::Key(KeyCommand::Manage { keys, log_file }) => {
                 assert_eq!(keys.keys_file, PathBuf::from("/tmp/other.json"));
+                assert_eq!(log_file, PathBuf::from("proxy.jsonl"));
             }
             other => panic!("expected key manage, got {other:?}"),
         }

@@ -171,7 +171,8 @@ mistralrs_proxy backend reload
 running/capacity and waiting counts, KV use, token rate, pressure, and metric
 age. Use `list --json` or `status --json` for automation. Every backend command
 accepts `--control-socket`; it must match the server's socket. In `manage`, use
-`↑`/`↓` to select, `d` to drain with confirmation, `D` to force-disable with
+`↑`/`↓` to select, `←`/`→` (or `h`/`l`) to scroll the table horizontally on
+narrow terminals, `d` to drain with confirmation, `D` to force-disable with
 confirmation, `a` to activate, `r` to reload `runtime.toml`, `R` to refresh
 immediately, `?` to list every key, and `q` to quit.
 
@@ -250,18 +251,23 @@ upstream APIs work as usual. An unknown key gets `401`, a disabled key gets
 
 ```console
 mistralrs_proxy key manage
+mistralrs_proxy key manage --log-file /path/to/proxy.jsonl
 ```
 
-An interactive view of every key and its flags:
+An interactive view of every key and its flags, plus a usage panel below it:
+requests and input/cached/prefilled/output tokens per key, aggregated from the
+audit log (`--log-file`, `LOG_FILE`, default `proxy.jsonl`; `r` re-reads both
+keys and usage). Prefilled is the input minus what the prefix cache served.
 
 | Key | Action |
 | --- | --- |
 | `↑` `↓` | Move |
+| `←` `→` | Scroll the tables horizontally |
 | `a` | Toggle admin |
 | `d` | Enable/disable the key |
 | `x` | Delete the key |
 | `s` | Save |
-| `r` | Reload, discarding edits |
+| `r` | Reload keys and usage |
 | `q` | Quit |
 
 Edits apply when you press `s`, and take effect on the next restart. The last
@@ -285,13 +291,16 @@ reason, eligible-backend count, pressure inputs at dispatch, and time spent in
 the proxy before routing:
 
 ```json
-{"event":"request","request_id":"517e8f4e-...","started_at":"2026-08-20T13:50:24.447Z","duration_ms":652,"time_to_first_byte_ms":256,"client_ip":"127.0.0.1","method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"HFTLdymp","backend_id":"gh200-b","routing_policy":"least-pressure-v1","routing_reason":"fresh_metrics_lowest_pressure","eligible_backend_count":2,"backend_pressure_at_dispatch":0.21875,"backend_running_at_dispatch":5,"backend_waiting_at_dispatch":0,"backend_capacity_at_dispatch":32,"backend_kv_pressure_at_dispatch":0.73,"backend_metrics_age_ms":184,"backend_proxy_active_at_dispatch":2,"proxy_queue_ms":1,"status":200,"streaming":true,"input_tokens":480,"output_tokens":12,"total_tokens":492,"complete":true}
+{"event":"request","request_id":"517e8f4e-...","started_at":"2026-08-20T13:50:24.447Z","duration_ms":652,"time_to_first_byte_ms":256,"client_ip":"127.0.0.1","method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"HFTLdymp","backend_id":"gh200-b","routing_policy":"least-pressure-v1","routing_reason":"fresh_metrics_lowest_pressure","eligible_backend_count":2,"backend_pressure_at_dispatch":0.21875,"backend_running_at_dispatch":5,"backend_waiting_at_dispatch":0,"backend_capacity_at_dispatch":32,"backend_kv_pressure_at_dispatch":0.73,"backend_metrics_age_ms":184,"backend_proxy_active_at_dispatch":2,"proxy_queue_ms":1,"status":200,"streaming":true,"input_tokens":480,"output_tokens":12,"total_tokens":492,"cached_tokens":320,"complete":true}
 ```
 
 Streaming requests produce one record too, written when the stream ends. Token
 counts come from the API's own `usage` field; they are `null` if the upstream
 did not report usage, or if the client hung up before it arrived. For streaming
 Chat Completions, ask for usage with `"stream_options": {"include_usage": true}`.
+When the engine reports its prefix-cache breakdown, `cached_tokens` holds how
+many input tokens were served from the cache instead of recomputed; it is
+`null` on engines that do not report it.
 
 The log file is created `chmod 600`. For rotation, use `copytruncate` or restart
 the service after a rename; an already-open writer continues writing its inode.
@@ -309,19 +318,23 @@ it only reads, and picks up new requests as they land.
 
 Three views, `tab` to switch:
 
-- **Summary** — request and status counts, total tokens, the streaming mix,
-  p50/p95/max for prompt size, completion size, time to first token, per-token
-  latency and total latency, plus totals by key and endpoint.
-- **Backends** — historical routed-request share, token totals, errors, proxy
-  queue p95, time-to-first-byte p95, and end-to-end latency p95 per backend.
-- **Requests** — every request, newest first, with the full record for whichever
-  one is selected.
+- **Summary** — request and status counts, total tokens, the prefix-cache
+  breakdown (cached tokens, hit rate, tokens actually prefilled), the streaming
+  mix, p50/p95/max for prompt size, completion size, cache hit rate, time to
+  first token, per-token latency and total latency, plus totals by key and
+  endpoint.
+- **Backends** — historical routed-request share, token totals (in, cached,
+  prefilled, out), errors, proxy queue p95, time-to-first-byte p95, and
+  end-to-end latency p95 per backend.
+- **Requests** — every request, newest first, with input/cached/output tokens
+  and the full record for whichever one is selected.
 
 | Key | Action |
 | --- | --- |
 | `tab` | Switch view |
 | `1` / `2` / `3` | Summary / Backends / Requests |
 | `↑` `↓` | Move |
+| `←` `→` | Scroll the table horizontally |
 | `/` | Filter by key, endpoint, status, id… |
 | `e` | Show only errors and incomplete requests |
 | `r` | Refresh now |
@@ -340,6 +353,7 @@ proxy.jsonl
   requests           10   authorized 9   rejected 1   incomplete 0
   statuses   2xx 9   3xx 0   4xx 1   5xx 0   none 0
   tokens          1,760 in   44 out   1,804 total
+  cache             612 cached   34.8% of input   1,148 prefilled
   shape               6 streaming   3 non-streaming
 
                                P50         P95         MAX   SAMPLES
@@ -348,17 +362,18 @@ proxy.jsonl
   first token                255ms       256ms       256ms         6
   per output token          95.8ms      98.8ms      98.8ms         9
   total latency              383ms       652ms       652ms        10
+  cache hit %                 40%         75%         75%         9
 
-  KEY                       REQUESTS            IN           OUT   ERRORS
-  alice                            9         1,760            44        0
-  (unauthenticated)                1             0             0        1
+  KEY                       REQUESTS          IN      CACHED   PREFILLED         OUT ERRORS
+  alice                            9         1,760         612       1,148            44      0
+  (unauthenticated)                1             0           0             0             0      1
 
-  ENDPOINT                            REQUESTS            IN           OUT
-  /v1/chat/completions                       9         1,760            44
-  /v1/models                                 1             0             0
+  ENDPOINT                            REQUESTS          IN      CACHED   PREFILLED         OUT
+  /v1/chat/completions                       9         1,760         612       1,148            44
+  /v1/models                                 1             0           0             0             0
 
-  BACKEND             REQUESTS   SHARE          IN         OUT   ERRORS    QUEUE95     TTFB95  LATENCY95
-  gh200-a                    5   55.6%         960          24        0        1ms      255ms      620ms
+  BACKEND             REQUESTS   SHARE          IN      CACHED   PREFILLED         OUT   ERRORS
+  gh200-a                    5   55.6%         960         400         560            24        0
   gh200-b                    4   44.4%         800          20        0        1ms      256ms      652ms
 ```
 
@@ -380,3 +395,8 @@ its total latency; including those would blur the number rather than inform it.
 number that does not move with how much the model chose to write, which makes it
 the one worth comparing across days. For short completions it is dominated by
 prefill.
+
+The `cache hit %` row only appears once some request has reported cached
+tokens; it is the per-request share of the prompt served from the engine's
+prefix cache. A falling number means prompts are no longer hitting the cache —
+traffic shifting across backends, or the cache being evicted.
