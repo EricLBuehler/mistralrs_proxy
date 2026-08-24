@@ -8,8 +8,9 @@ use std::{
 
 use ratatui::{
     Frame,
+    buffer::Buffer,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout, Margin, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
@@ -23,6 +24,13 @@ use crate::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_POLL: Duration = Duration::from_millis(100);
+/// Fixed natural width of the backend table: 2px of highlight-symbol slot,
+/// 12 columns plus 1px of spacing each. Fits unscrolled in a 100-column
+/// terminal; narrower terminals scroll it with ←/→ so every column stays
+/// reachable, wider terminals stretch the trailing column instead.
+const TABLE_WIDTH: u16 = 98;
+/// ←/→ scroll step in cells.
+const SCROLL_STEP: u16 = 8;
 
 /// Open a terminal UI backed by the running proxy's private control socket.
 pub async fn manage(client: ControlClient) -> Result<(), Box<dyn Error>> {
@@ -51,6 +59,7 @@ struct App {
     mode: Mode,
     show_help: bool,
     status: String,
+    table_scroll: u16,
     last_refresh: Instant,
     quit: bool,
 }
@@ -66,6 +75,7 @@ impl App {
             selected: 0,
             mode: Mode::Browse,
             show_help: false,
+            table_scroll: 0,
             last_refresh: Instant::now(),
             quit: false,
         }
@@ -138,6 +148,12 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected =
                     (self.selected + 1).min(self.response.backends.len().saturating_sub(1));
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.table_scroll = self.table_scroll.saturating_sub(SCROLL_STEP);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.table_scroll = self.table_scroll.saturating_add(SCROLL_STEP);
             }
             KeyCode::Home => self.selected = 0,
             KeyCode::End => self.selected = self.response.backends.len().saturating_sub(1),
@@ -307,6 +323,10 @@ impl App {
             header,
         );
 
+        // The table is a fixed 98px wide (12 columns + spacing) and always
+        // shows every column. It fits unscrolled from 100 columns on; narrower
+        // terminals render it off-screen and blit a ←/→-scrollable window of
+        // it, so no column is ever dropped or clipped mid-value.
         let rows = self.response.backends.iter().map(|backend| {
             let style = match backend.mode {
                 BackendMode::Disabled => Style::default().fg(Color::DarkGray),
@@ -333,24 +353,24 @@ impl App {
         let table_widget = Table::new(
             rows,
             [
-                Constraint::Length(18),
+                Constraint::Length(12),
                 Constraint::Length(8),
                 Constraint::Length(12),
+                Constraint::Length(5),
                 Constraint::Length(7),
-                Constraint::Length(9),
+                Constraint::Length(5),
+                Constraint::Length(5),
                 Constraint::Length(6),
                 Constraint::Length(6),
                 Constraint::Length(8),
-                Constraint::Length(9),
-                Constraint::Length(10),
-                Constraint::Length(7),
-                Constraint::Min(7),
+                Constraint::Length(5),
+                Constraint::Min(6),
             ],
         )
         .header(
             Row::new([
                 "BACKEND", "MODE", "STATE", "PROXY", "RUN/CAP", "WAIT", "KV%", "TOK/S",
-                "PREF T/S", "DECODE T/S", "PRESS", "AGE",
+                "PREF/S", "DECODE/S", "PRESS", "AGE",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
         )
@@ -361,13 +381,34 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
+
+        let visible = table.width.saturating_sub(2);
+        // The table keeps its 98px natural width when the terminal is narrow
+        // (scrolling makes the rest reachable) and stretches to the terminal
+        // when it is wider, so the trailing column absorbs the slack.
+        let table_width = TABLE_WIDTH.max(visible);
+        let scroll = self.table_scroll.min(table_width.saturating_sub(visible));
+
+        let mut offscreen = Buffer::empty(Rect::new(0, 0, table_width, table.height));
         let mut table_state = TableState::default()
             .with_selected((!self.response.backends.is_empty()).then_some(self.selected));
-        frame.render_stateful_widget(
+        ratatui::widgets::StatefulWidget::render(
             table_widget,
-            table.inner(Margin::new(1, 0)),
+            Rect::new(0, 0, table_width, table.height),
+            &mut offscreen,
             &mut table_state,
         );
+
+        let buffer = frame.buffer_mut();
+        for y in 0..table.height {
+            for x in 0..visible {
+                let source = scroll + x;
+                if source >= table_width {
+                    break;
+                }
+                buffer[(table.x + 1 + x, table.y + y)] = offscreen[(source, y)].clone();
+            }
+        }
 
         let details = self.selected_backend().map_or_else(
             || "No configured backends.".to_owned(),
@@ -416,7 +457,7 @@ impl App {
         } else if self.show_help {
             "Press ?, q, or Esc to close help"
         } else {
-            "↑/↓ move   d drain   D force-disable   a activate   r reload runtime   R refresh   ? help   q quit"
+            "↑/↓ move ←/→ scroll d drain D force-disable a activate r reload R refresh ? help q quit"
         };
         let help_style = if self.mode == Mode::ConfirmDrain || self.mode == Mode::ConfirmDisable {
             Style::default().fg(Color::Black).bg(Color::Yellow)
@@ -455,6 +496,8 @@ impl App {
         let rows = [
             ("j / ↓", "move down"),
             ("k / ↑", "move up"),
+            ("h / ←", "scroll table left"),
+            ("l / →", "scroll table right"),
             ("Home / End", "first / last backend"),
             ("d", "drain: stop new work, wait for idle"),
             ("D", "force-disable: skip the idle wait"),
@@ -582,11 +625,82 @@ mod tests {
         assert!(screen.contains("RUN/CAP"), "{screen}");
         assert!(screen.contains("3/8"), "{screen}");
         assert!(screen.contains("42%"), "{screen}");
-        assert!(screen.contains("PREF T/S"), "{screen}");
-        assert!(screen.contains("DECODE T/S"), "{screen}");
+        assert!(screen.contains("TOK/S"), "{screen}");
+        assert!(screen.contains("PREF/S"), "{screen}");
+        assert!(screen.contains("DECODE/S"), "{screen}");
         assert!(screen.contains("400.0"), "{screen}");
         assert!(screen.contains("834.5"), "{screen}");
         assert!(screen.contains("closed"), "{screen}");
+    }
+
+    #[test]
+    fn every_column_fits_unscrolled_at_one_hundred_columns() {
+        let app = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        // The full 98px table fits in a 100-column terminal, so every header
+        // is complete and no value column is squeezed.
+        for needle in [
+            "BACKEND",
+            "MODE",
+            "STATE",
+            "PROXY",
+            "RUN/CAP",
+            "WAIT",
+            "KV%",
+            "TOK/S",
+            "PREF/S",
+            "DECODE/S",
+            "PRESS",
+            "AGE",
+            "123.4",
+            "400.0",
+            "834.5",
+            "0.50",
+            "0.1s",
+        ] {
+            assert!(screen.contains(needle), "{needle} missing from:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn narrow_terminal_scrolls_to_reach_every_column() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 18)).unwrap();
+
+        // At 70 columns the right side of the table is out of view at first...
+        let mut app = app();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("BACKEND"), "{screen}");
+        assert!(!screen.contains("DECODE/S"), "{screen}");
+
+        // ...and scrolling right reveals it. Overscroll clamps at the edge.
+        app.table_scroll = u16::MAX;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("DECODE/S"), "{screen}");
+        assert!(screen.contains("AGE"), "{screen}");
+        assert!(!screen.contains("BACKEND"), "{screen}");
+    }
+
+    #[test]
+    fn overscroll_clamps_back_to_zero_when_the_table_fits() {
+        let mut app = app();
+        app.table_scroll = u16::MAX;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        // Overscrolling a terminal that fits the whole table renders it from
+        // the start, so both ends are visible at once.
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("BACKEND"), "{screen}");
+        assert!(screen.contains("DECODE/S"), "{screen}");
     }
 
     #[test]
@@ -650,3 +764,5 @@ mod tests {
         assert!(!app.show_help);
     }
 }
+
+
