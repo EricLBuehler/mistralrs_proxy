@@ -11,7 +11,6 @@ pub mod logs;
 pub mod manage;
 pub mod proxy;
 pub mod register;
-pub mod render;
 pub mod routing;
 pub mod runtime;
 pub mod telemetry;

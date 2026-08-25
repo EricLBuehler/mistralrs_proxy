@@ -82,9 +82,6 @@ struct App {
     needle: String,
     editing_filter: bool,
     errors_only: bool,
-    /// Horizontal scroll offset for the tables of the current view; clamped
-    /// at draw time, a no-op when the table fits.
-    table_scroll: u16,
     status: String,
     quit: bool,
 }
@@ -105,7 +102,6 @@ impl App {
             needle: String::new(),
             editing_filter: false,
             errors_only: false,
-            table_scroll: 0,
             status,
             quit: false,
         }
@@ -203,15 +199,7 @@ impl App {
 
         let last = self.visible().len().saturating_sub(1);
         match code {
-            KeyCode::Tab => self.view = self.view.next(),
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.table_scroll =
-                    self.table_scroll.saturating_sub(crate::render::SCROLL_STEP);
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.table_scroll =
-                    self.table_scroll.saturating_add(crate::render::SCROLL_STEP);
-            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Left => self.view = self.view.next(),
             KeyCode::Char('1') => self.view = View::Summary,
             KeyCode::Char('2') => self.view = View::Backends,
             KeyCode::Char('3') => self.view = View::Requests,
@@ -317,7 +305,7 @@ impl App {
                 (false, false) => format!("  [/{}]", self.needle),
                 (false, true) => format!("  [/{} + errors]", self.needle),
             };
-            format!("tab views   ↑/↓ move   ←/→ scroll   / filter   e errors   r refresh   q quit{scope}")
+            format!("tab views   ↑/↓ move   / filter   e errors   r refresh   q quit{scope}")
         };
         let help_style = if self.editing_filter {
             Style::default().fg(Color::Black).bg(Color::Yellow)
@@ -377,17 +365,6 @@ impl App {
                 )),
             ]),
             Line::from(vec![
-                label("cache    "),
-                Span::raw(format!(
-                    "{} cached   {} of input   {} prefilled",
-                    thousands(summary.cached_tokens),
-                    summary
-                        .cache_hit_pct()
-                        .map_or_else(|| "-".to_owned(), |pct| format!("{pct:.1}%")),
-                    thousands(summary.prefilled_tokens),
-                )),
-            ]),
-            Line::from(vec![
                 label("shape    "),
                 Span::raw(format!(
                     "{} streaming   {} non-streaming",
@@ -437,49 +414,31 @@ impl App {
 
         let key_rows = summary.by_key.iter().map(|(name, totals)| {
             Row::new(vec![
-                Cell::from(truncate(name, 22)),
+                Cell::from(truncate(name, 28)),
                 Cell::from(thousands(totals.requests as u64)),
                 Cell::from(thousands(totals.input_tokens)),
-                Cell::from(thousands(totals.cached_tokens)),
-                Cell::from(thousands(totals.prefilled_tokens)),
                 Cell::from(thousands(totals.output_tokens)),
                 Cell::from(totals.errors.to_string()),
             ])
         });
-        {
-            let mut state = TableState::default();
-            crate::render::render_scrolled_table(
-                frame,
-                totals_table(key_rows, "KEY"),
-                keys_area.inner(Margin::new(1, 0)),
-                TOTALS_TABLE_WIDTH,
-                self.table_scroll,
-                &mut state,
-            );
-        }
+        frame.render_widget(
+            totals_table(key_rows, "KEY"),
+            keys_area.inner(Margin::new(1, 0)),
+        );
 
         let path_rows = summary.by_path.iter().map(|(path, totals)| {
             Row::new(vec![
-                Cell::from(truncate(path, 22)),
+                Cell::from(truncate(path, 28)),
                 Cell::from(thousands(totals.requests as u64)),
                 Cell::from(thousands(totals.input_tokens)),
-                Cell::from(thousands(totals.cached_tokens)),
-                Cell::from(thousands(totals.prefilled_tokens)),
                 Cell::from(thousands(totals.output_tokens)),
                 Cell::from(totals.errors.to_string()),
             ])
         });
-        {
-            let mut state = TableState::default();
-            crate::render::render_scrolled_table(
-                frame,
-                totals_table(path_rows, "ENDPOINT"),
-                paths_area.inner(Margin::new(1, 0)),
-                TOTALS_TABLE_WIDTH,
-                self.table_scroll,
-                &mut state,
-            );
-        }
+        frame.render_widget(
+            totals_table(path_rows, "ENDPOINT"),
+            paths_area.inner(Margin::new(1, 0)),
+        );
     }
 
     fn draw_backends(&self, frame: &mut Frame, area: Rect) {
@@ -526,8 +485,6 @@ impl App {
                 Cell::from(thousands(totals.requests as u64)),
                 Cell::from(format!("{share:.1}%")),
                 Cell::from(thousands(totals.input_tokens)),
-                Cell::from(thousands(totals.cached_tokens)),
-                Cell::from(thousands(totals.prefilled_tokens)),
                 Cell::from(thousands(totals.output_tokens)),
                 Cell::from(totals.errors.to_string()),
                 Cell::from(distribution_p95(totals.queue_ms)),
@@ -543,8 +500,6 @@ impl App {
                 Constraint::Length(9),
                 Constraint::Length(12),
                 Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(12),
                 Constraint::Length(9),
                 Constraint::Length(11),
                 Constraint::Length(11),
@@ -553,20 +508,19 @@ impl App {
         )
         .header(
             Row::new([
-                "BACKEND", "REQUESTS", "SHARE", "IN", "CACHED", "PREFILLED", "OUT", "ERRORS",
-                "QUEUE95", "TTFB95", "LATENCY95",
+                "BACKEND",
+                "REQUESTS",
+                "SHARE",
+                "IN",
+                "OUT",
+                "ERRORS",
+                "QUEUE95",
+                "TTFB95",
+                "LATENCY95",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
         );
-        let mut state = TableState::default();
-        crate::render::render_scrolled_table(
-            frame,
-            table,
-            table_area.inner(Margin::new(1, 0)),
-            BACKENDS_TABLE_WIDTH,
-            self.table_scroll,
-            &mut state,
-        );
+        frame.render_widget(table, table_area.inner(Margin::new(1, 0)));
     }
 
     fn draw_requests(&self, frame: &mut Frame, area: Rect) {
@@ -588,7 +542,6 @@ impl App {
                 ),
                 Cell::from(duration(record.duration_ms)),
                 Cell::from(tokens(record.input_tokens)),
-                Cell::from(tokens(record.cached_tokens)),
                 Cell::from(tokens(record.output_tokens)),
             ])
             .style(status_style(record))
@@ -604,14 +557,12 @@ impl App {
                 Constraint::Length(6),
                 Constraint::Length(8),
                 Constraint::Length(8),
-                Constraint::Length(8),
                 Constraint::Min(8),
             ],
         )
         .header(
             Row::new(vec![
-                "TIME", "METHOD", "ENDPOINT", "KEY", "BACKEND", "STATUS", "TOOK", "IN", "CACHED",
-                "OUT",
+                "TIME", "METHOD", "ENDPOINT", "KEY", "BACKEND", "STATUS", "TOOK", "IN", "OUT",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
         )
@@ -628,14 +579,7 @@ impl App {
         // the list is empty.
         let mut state = TableState::default()
             .with_selected((!visible.is_empty()).then(|| self.selected.min(visible.len() - 1)));
-        crate::render::render_scrolled_table(
-            frame,
-            table,
-            table_area.inner(Margin::new(1, 0)),
-            REQUESTS_TABLE_WIDTH,
-            self.table_scroll,
-            &mut state,
-        );
+        frame.render_stateful_widget(table, table_area.inner(Margin::new(1, 0)), &mut state);
 
         let detail = match visible.get(self.selected.min(visible.len().saturating_sub(1))) {
             Some(record) => detail_lines(record),
@@ -660,29 +604,18 @@ fn totals_table<'a>(rows: impl IntoIterator<Item = Row<'a>>, first: &'a str) -> 
     Table::new(
         rows,
         [
-            Constraint::Length(22),
+            Constraint::Length(29),
             Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Min(8),
         ],
     )
     .header(
-        Row::new(vec![
-            first, "REQUESTS", "IN", "CACHED", "PREFILLED", "OUT", "ERRORS",
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+        Row::new(vec![first, "REQUESTS", "IN", "OUT", "ERRORS"])
+            .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
     )
 }
-
-/// Natural widths of the TUI tables (columns + 1px spacing + the 2px
-/// highlight-symbol slot). They are rendered off-screen and blitted as a
-/// scrollable window, so they stay intact below their natural width.
-const TOTALS_TABLE_WIDTH: u16 = 96;
-const BACKENDS_TABLE_WIDTH: u16 = 145;
-const REQUESTS_TABLE_WIDTH: u16 = 126;
 
 fn detail_lines(record: &LogRecord) -> Vec<Line<'static>> {
     let unknown = |value: &Option<String>| value.clone().unwrap_or_else(|| "-".to_owned());
@@ -736,18 +669,10 @@ fn detail_lines(record: &LogRecord) -> Vec<Line<'static>> {
         Line::from(vec![
             label("tokens  "),
             Span::raw(format!(
-                "{} in   {} out   {} total   {}",
+                "{} in   {} out   {} total",
                 tokens(record.input_tokens),
                 tokens(record.output_tokens),
                 tokens(record.total_tokens),
-                match (record.cached_tokens, record.input_tokens) {
-                    (Some(cached), Some(input)) if input > 0 => format!(
-                        "{cached} cached ({}% of input)",
-                        100 * cached / input
-                    ),
-                    (Some(cached), _) => format!("{cached} cached"),
-                    (None, _) => "no cache data".to_owned(),
-                },
             )),
         ]),
         Line::from(vec![
@@ -840,7 +765,7 @@ mod tests {
 
     fn sample_app() -> App {
         app_with(concat!(
-            r#"{"request_id":"aaaaaaaa-0000-0000-0000-000000000001","started_at":"2026-08-20T10:00:00.000Z","started_at_unix_ms":1,"duration_ms":120,"method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"AAAAAAAA","key_sha256":"aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66","key_admin":true,"backend_id":"gh200-a","routing_policy":"least-pressure-v1","routing_reason":"fresh_metrics_lowest_pressure","eligible_backend_count":2,"backend_pressure_at_dispatch":0.25,"proxy_queue_ms":1,"status":200,"authorized":true,"streaming":true,"input_tokens":1234,"output_tokens":56,"cached_tokens":500,"response_bytes":900,"complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5000,"http_version":"HTTP/1.1","user_agent":"openai-python/1.2.3","time_to_first_byte_ms":40}"#,
+            r#"{"request_id":"aaaaaaaa-0000-0000-0000-000000000001","started_at":"2026-08-20T10:00:00.000Z","started_at_unix_ms":1,"duration_ms":120,"method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"AAAAAAAA","key_sha256":"aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66","key_admin":true,"backend_id":"gh200-a","routing_policy":"least-pressure-v1","routing_reason":"fresh_metrics_lowest_pressure","eligible_backend_count":2,"backend_pressure_at_dispatch":0.25,"proxy_queue_ms":1,"status":200,"authorized":true,"streaming":true,"input_tokens":1234,"output_tokens":56,"response_bytes":900,"complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5000,"http_version":"HTTP/1.1","user_agent":"openai-python/1.2.3","time_to_first_byte_ms":40}"#,
             "\n",
             r#"{"request_id":"bbbbbbbb-0000-0000-0000-000000000002","started_at":"2026-08-20T10:00:05.000Z","started_at_unix_ms":2,"duration_ms":3000,"method":"GET","uri":"/v1/models","status":401,"authorized":false,"auth_error":"invalid_api_key","complete":true,"termination":"complete","client_ip":"127.0.0.1","client_port":5001}"#,
             "\n",
@@ -870,10 +795,6 @@ mod tests {
         assert!(screen.contains("first token"), "{screen}");
         assert!(screen.contains("per output token"), "{screen}");
         assert!(screen.contains("1 streaming"), "{screen}");
-        assert!(screen.contains("500 cached"), "{screen}");
-        assert!(screen.contains("40.5% of input"), "{screen}");
-        assert!(screen.contains("734 prefilled"), "{screen}");
-        assert!(screen.contains("cache hit %"), "{screen}");
     }
 
     #[test]
@@ -881,25 +802,14 @@ mod tests {
         let mut app = sample_app();
         app.handle(KeyCode::Char('2'));
 
-        // At the default scroll the left and middle columns are in view...
         let screen = rendered(&app);
 
         assert!(screen.contains("Backends"), "{screen}");
         assert!(screen.contains("gh200-a"), "{screen}");
         assert!(screen.contains("100.0%"), "{screen}");
-        assert!(screen.contains("CACHED"), "{screen}");
-        assert!(screen.contains("PREFILLED"), "{screen}");
-        assert!(!screen.contains("LATENCY95"), "{screen}");
-
-        // ...and the latency columns on the right need a scroll.
-        app.table_scroll = u16::MAX;
-
-        let screen = rendered(&app);
-
         assert!(screen.contains("QUEUE95"), "{screen}");
         assert!(screen.contains("TTFB95"), "{screen}");
         assert!(screen.contains("LATENCY95"), "{screen}");
-        assert!(!screen.contains("gh200-a"), "{screen}");
     }
 
     #[test]
@@ -1032,4 +942,3 @@ mod tests {
         assert_eq!(app.visible()[app.selected].request_id, "old");
     }
 }
-

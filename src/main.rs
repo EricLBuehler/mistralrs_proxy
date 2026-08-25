@@ -38,9 +38,7 @@ fn main() -> ExitCode {
         Command::Key(KeyCommand::Create { name, admin, keys }) => {
             manage::create(&keys.keys_file, &name, admin)
         }
-        Command::Key(KeyCommand::Manage { keys, log_file }) => {
-            manage::manage(&keys.keys_file, &log_file)
-        }
+        Command::Key(KeyCommand::Manage { keys }) => manage::manage(&keys.keys_file),
         Command::Backend(command) => backend_cli::run(command),
         Command::Logs(args) => logs::run(&args.log_file, args.summary),
     };
