@@ -24,7 +24,10 @@ pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
-}
+    /// Prompt tokens served from the prefix cache instead of recomputed.
+    /// Absent on engines that do not report it, or when nothing was cached.
+    pub cached_tokens: Option<u64>,
+} 
 
 impl Usage {
     fn is_informative(&self) -> bool {
@@ -41,6 +44,15 @@ struct UsageFields {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// Chat Completions / Completions API prefix-cache breakdown.
+    prompt_tokens_details: Option<TokensDetails>,
+    /// Responses API prefix-cache breakdown.
+    input_tokens_details: Option<TokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct TokensDetails {
+    cached_tokens: Option<u64>,
 }
 
 impl From<UsageFields> for Usage {
@@ -49,6 +61,10 @@ impl From<UsageFields> for Usage {
             input_tokens: fields.input_tokens.or(fields.prompt_tokens),
             output_tokens: fields.output_tokens.or(fields.completion_tokens),
             total_tokens: fields.total_tokens,
+            cached_tokens: fields
+                .prompt_tokens_details
+                .or(fields.input_tokens_details)
+                .and_then(|details| details.cached_tokens),
         }
     }
 }
@@ -230,6 +246,7 @@ mod tests {
                 input_tokens: Some(11),
                 output_tokens: Some(4),
                 total_tokens: Some(15),
+                cached_tokens: None,
             })
         );
     }
@@ -246,6 +263,7 @@ mod tests {
                 input_tokens: Some(7),
                 output_tokens: Some(21),
                 total_tokens: Some(28),
+                cached_tokens: Some(0),
             })
         );
     }
@@ -265,6 +283,7 @@ mod tests {
                 input_tokens: Some(3),
                 output_tokens: Some(9),
                 total_tokens: Some(12),
+                cached_tokens: None,
             })
         );
     }
@@ -285,6 +304,7 @@ mod tests {
                 input_tokens: Some(2),
                 output_tokens: Some(5),
                 total_tokens: Some(7),
+                cached_tokens: None,
             })
         );
     }
@@ -301,6 +321,7 @@ mod tests {
                 input_tokens: Some(1),
                 output_tokens: Some(2),
                 total_tokens: Some(3),
+                cached_tokens: None,
             })
         );
     }
@@ -308,6 +329,39 @@ mod tests {
     #[test]
     fn a_string_valued_usage_field_is_ignored() {
         assert_eq!(sniff(&[r#"{"usage":"high","choices":[]}"#]), None);
+    }
+
+    #[test]
+    fn reads_chat_completion_cached_tokens() {
+        let body = r#"{"usage":{"prompt_tokens":480,"completion_tokens":12,
+            "total_tokens":492,"prompt_tokens_details":{"cached_tokens":320}}}"#;
+
+        assert_eq!(
+            sniff(&[body]),
+            Some(Usage {
+                input_tokens: Some(480),
+                output_tokens: Some(12),
+                total_tokens: Some(492),
+                cached_tokens: Some(320),
+            })
+        );
+    }
+
+    #[test]
+    fn reads_responses_api_cached_tokens() {
+        let body = r#"{"usage":{"input_tokens":500,
+            "input_tokens_details":{"cached_tokens":450},"output_tokens":20,
+            "total_tokens":520}}"#;
+
+        assert_eq!(
+            sniff(&[body]),
+            Some(Usage {
+                input_tokens: Some(500),
+                output_tokens: Some(20),
+                total_tokens: Some(520),
+                cached_tokens: Some(450),
+            })
+        );
     }
 
     #[test]
@@ -321,6 +375,7 @@ mod tests {
                 input_tokens: Some(4),
                 output_tokens: Some(6),
                 total_tokens: None,
+                cached_tokens: Some(0),
             })
         );
     }
@@ -338,6 +393,7 @@ mod tests {
                 input_tokens: Some(1),
                 output_tokens: Some(1),
                 total_tokens: Some(2),
+                cached_tokens: None,
             })
         );
     }

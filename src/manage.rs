@@ -9,7 +9,7 @@ use std::{
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout, Margin},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Paragraph, Row, Table, TableState},
@@ -18,6 +18,7 @@ use ratatui::{
 use crate::{
     keys::{KeyFile, KeyRecord},
     logging::format_timestamp,
+    logs::{self, thousands, KeyTotals},
 };
 
 /// Issue a key, append it to the database, and print it once.
@@ -57,7 +58,7 @@ pub fn create(path: &Path, name: &str, admin: bool) -> Result<(), Box<dyn Error>
 }
 
 /// Open the interactive key manager.
-pub fn manage(path: &Path) -> Result<(), Box<dyn Error>> {
+pub fn manage(path: &Path, log_file: &Path) -> Result<(), Box<dyn Error>> {
     let file = KeyFile::load_or_default(path)?;
     if file.keys.is_empty() {
         return Err(format!(
@@ -70,7 +71,7 @@ pub fn manage(path: &Path) -> Result<(), Box<dyn Error>> {
         return Err("`key manage` needs an interactive terminal".into());
     }
 
-    let mut app = App::new(file, path);
+    let mut app = App::new(file, path, log_file, read_key_usage(log_file));
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
     ratatui::restore();
@@ -83,6 +84,16 @@ pub fn manage(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Per-key token totals from the audit log, for the usage panel. `None` when
+/// the log does not exist; an empty log simply yields an empty table.
+fn read_key_usage(log_file: &Path) -> Option<Vec<(String, KeyTotals)>> {
+    if !log_file.exists() {
+        return None;
+    }
+    let records = logs::Tail::new(log_file).poll().ok()?.records;
+    Some(logs::summarize(&records).by_key)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Browse,
@@ -92,24 +103,37 @@ enum Mode {
 
 struct App<'a> {
     path: &'a Path,
+    log_file: &'a Path,
+    /// Per-key token usage from the audit log, or `None` when the log is
+    /// missing and the usage panel says so.
+    usage: Option<Vec<(String, KeyTotals)>>,
     file: KeyFile,
     selected: usize,
     dirty: bool,
     saved: bool,
     status: String,
+    table_scroll: u16,
     mode: Mode,
     quit: bool,
 }
 
 impl<'a> App<'a> {
-    fn new(file: KeyFile, path: &'a Path) -> Self {
+    fn new(
+        file: KeyFile,
+        path: &'a Path,
+        log_file: &'a Path,
+        usage: Option<Vec<(String, KeyTotals)>>,
+    ) -> Self {
         Self {
             path,
+            log_file,
+            usage,
             file,
             selected: 0,
             dirty: false,
             saved: false,
             status: format!("Loaded {}", path.display()),
+            table_scroll: 0,
             mode: Mode::Browse,
             quit: false,
         }
@@ -177,6 +201,14 @@ impl<'a> App<'a> {
             }
             KeyCode::Char('s') => self.save(),
             KeyCode::Char('r') => self.reload(),
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.table_scroll =
+                    self.table_scroll.saturating_sub(crate::render::SCROLL_STEP);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.table_scroll =
+                    self.table_scroll.saturating_add(crate::render::SCROLL_STEP);
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 if self.dirty {
                     self.mode = Mode::ConfirmDiscard;
@@ -266,15 +298,17 @@ impl<'a> App<'a> {
                 self.file = file;
                 self.selected = self.selected.min(self.file.keys.len().saturating_sub(1));
                 self.dirty = false;
-                self.status = "Reloaded from disk; unsaved edits discarded.".to_owned();
+                self.usage = read_key_usage(self.log_file);
+                self.status = "Reloaded keys and usage; unsaved edits discarded.".to_owned();
             }
             Err(error) => self.status = format!("Could not reload: {error}"),
         }
     }
 
     fn draw(&self, frame: &mut Frame) {
-        let [header, body, footer, status] = Layout::vertical([
+        let [header, keys_area, usage_area, footer, status] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Min(3),
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -353,11 +387,20 @@ impl<'a> App<'a> {
         .block(Block::new());
 
         let mut state = TableState::default().with_selected(Some(self.selected));
-        frame.render_stateful_widget(table, body.inner(Margin::new(1, 0)), &mut state);
+        crate::render::render_scrolled_table(
+            frame,
+            table,
+            keys_area.inner(Margin::new(1, 0)),
+            KEYS_TABLE_WIDTH,
+            self.table_scroll,
+            &mut state,
+        );
+
+        self.draw_usage(frame, usage_area);
 
         let help = match self.mode {
             Mode::Browse => {
-                "↑/↓ move   a admin   d disable   x delete   s save   r reload   q quit"
+                "↑/↓ move ←/→ scroll   a admin   d disable   x delete   s save   r reload   q quit"
             }
             Mode::ConfirmDelete => "Delete this key permanently? y / n",
             Mode::ConfirmDiscard => "Quit and discard unsaved changes? y / n",
@@ -380,7 +423,66 @@ impl<'a> App<'a> {
             status,
         );
     }
+
+    /// The per-key token panel, fed by the audit log rather than the key file.
+    fn draw_usage(&self, frame: &mut Frame, area: Rect) {
+        let title = format!(" key usage · {} ", self.log_file.display());
+        let table = match &self.usage {
+            None => {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "no audit log found; pass --log-file to show per-key token usage",
+                        Style::default().fg(Color::DarkGray),
+                    )))
+                    .block(Block::new().title(title)),
+                    area.inner(Margin::new(1, 0)),
+                );
+                return;
+            }
+            Some(rows) => Table::new(
+                rows.iter().map(|(name, totals)| {
+                    Row::new(vec![
+                        Cell::from(logs::truncate(name, 21)),
+                        Cell::from(thousands(totals.requests as u64)),
+                        Cell::from(thousands(totals.input_tokens)),
+                        Cell::from(thousands(totals.cached_tokens)),
+                        Cell::from(thousands(totals.prefilled_tokens)),
+                        Cell::from(thousands(totals.output_tokens)),
+                    ])
+                }),
+                [
+                    Constraint::Length(22),
+                    Constraint::Length(10),
+                    Constraint::Length(12),
+                    Constraint::Length(12),
+                    Constraint::Length(12),
+                    Constraint::Length(12),
+                ],
+            )
+            .header(
+                Row::new(vec!["KEY", "REQUESTS", "IN", "CACHED", "PREFILLED", "OUT"])
+                    .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+            )
+            .block(Block::new().title(title)),
+        };
+
+        let mut state = TableState::default();
+        crate::render::render_scrolled_table(
+            frame,
+            table,
+            area.inner(Margin::new(1, 0)),
+            USAGE_TABLE_WIDTH,
+            self.table_scroll,
+            &mut state,
+        );
+    }
 }
+
+/// Natural width of the keys table (columns + spacing + symbol slot; the
+/// trailing SHA column is the stretchable one).
+const KEYS_TABLE_WIDTH: u16 = 94;
+/// Natural width of the key usage table.
+const USAGE_TABLE_WIDTH: u16 = 89;
 
 #[cfg(test)]
 mod tests {
@@ -409,11 +511,52 @@ mod tests {
         terminal.backend().to_string()
     }
 
+    fn test_app(file: KeyFile, path: &Path) -> App<'_> {
+        App::new(file, path, Path::new("proxy.jsonl"), None)
+    }
+
+    #[test]
+    fn the_usage_panel_shows_per_key_cache_stats() {
+        let (file, path) = app_with(&[("alice", true)]);
+        let log = scratch().with_extension("jsonl");
+        // A JSONL record must be a single line.
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"request_id":"1","started_at":"2026-08-20T10:00:00.000Z","started_at_unix_ms":1,"duration_ms":10,"method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"AAAAAAAA","status":200,"authorized":true,"input_tokens":1000,"output_tokens":50,"cached_tokens":800,"complete":true,"termination":"complete"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let app = App::new(file, &path, &log, read_key_usage(&log));
+        let screen = rendered(&app);
+
+        assert!(screen.contains("key usage"), "{screen}");
+        assert!(screen.contains("CACHED"), "{screen}");
+        assert!(screen.contains("PREFILLED"), "{screen}");
+        assert!(screen.contains("800"), "{screen}");
+        assert!(screen.contains("200"), "{screen}");
+        assert!(screen.contains("alice"), "{screen}");
+    }
+
+    #[test]
+    fn the_usage_panel_notes_a_missing_audit_log() {
+        let (file, path) = app_with(&[("alice", true)]);
+        let missing = std::env::temp_dir().join("definitely-absent-key-usage.jsonl");
+
+        let app = App::new(file, &path, &missing, read_key_usage(&missing));
+        let screen = rendered(&app);
+
+        assert!(screen.contains("no audit log found"), "{screen}");
+        assert!(screen.contains("--log-file"), "{screen}");
+    }
+
     #[test]
     fn the_view_shows_every_key_with_its_flags() {
         let (mut file, path) = app_with(&[("admin", true), ("bot", false)]);
         file.keys[1].disabled = true;
-        let app = App::new(file, &path);
+        let app = test_app(file, &path);
         let identifier = app.file.keys[0].identifier.clone();
 
         let screen = rendered(&app);
@@ -436,7 +579,7 @@ mod tests {
     #[test]
     fn a_pending_confirmation_replaces_the_help_line() {
         let (file, path) = app_with(&[("admin", true), ("bot", false)]);
-        let mut app = App::new(file, &path);
+        let mut app = test_app(file, &path);
         app.handle(KeyCode::Down);
         app.handle(KeyCode::Char('x'));
 
@@ -476,7 +619,7 @@ mod tests {
     #[test]
     fn the_last_enabled_admin_key_cannot_be_removed_or_demoted() {
         let (file, path) = app_with(&[("admin", true), ("bot", false)]);
-        let mut app = App::new(file, &path);
+        let mut app = test_app(file, &path);
 
         app.handle_browse(KeyCode::Char('a'));
         assert!(app.file.keys[0].admin);
@@ -491,7 +634,7 @@ mod tests {
     #[test]
     fn a_second_admin_key_frees_the_first_one() {
         let (file, path) = app_with(&[("admin", true), ("other-admin", true)]);
-        let mut app = App::new(file, &path);
+        let mut app = test_app(file, &path);
 
         app.handle_browse(KeyCode::Char('d'));
 
@@ -502,7 +645,7 @@ mod tests {
     #[test]
     fn deleting_takes_a_confirmation_and_shifts_the_selection() {
         let (file, path) = app_with(&[("admin", true), ("bot", false)]);
-        let mut app = App::new(file, &path);
+        let mut app = test_app(file, &path);
 
         app.handle(KeyCode::Down);
         app.handle(KeyCode::Char('x'));
@@ -522,7 +665,7 @@ mod tests {
     #[test]
     fn quitting_with_unsaved_edits_asks_first() {
         let (file, path) = app_with(&[("admin", true), ("bot", false)]);
-        let mut app = App::new(file, &path);
+        let mut app = test_app(file, &path);
 
         app.handle(KeyCode::Down);
         app.handle(KeyCode::Char('d'));
@@ -537,7 +680,7 @@ mod tests {
     #[test]
     fn saving_writes_the_edits_and_leaves_no_unsaved_state() {
         let (file, path) = app_with(&[("admin", true), ("bot", false)]);
-        let mut app = App::new(file, &path);
+        let mut app = test_app(file, &path);
 
         app.handle(KeyCode::Down);
         app.handle(KeyCode::Char('d'));
@@ -550,3 +693,4 @@ mod tests {
         assert!(reloaded.keys[1].disabled);
     }
 }
+

@@ -866,6 +866,7 @@ struct RequestRecord<'a> {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
     complete: bool,
     termination: &'static str,
     error: Option<&'a str>,
@@ -888,7 +889,7 @@ fn write_record(
 
     if terminal_log {
         eprintln!(
-            "{}  <  {id}  {}  {}ms  in={} out={}  {}{}",
+            "{}  <  {id}  {}  {}ms  in={} out={}{}  {}{}",
             format_timestamp(finished_at_unix_ms),
             entry
                 .status
@@ -900,6 +901,9 @@ fn write_record(
             usage
                 .output_tokens
                 .map_or_else(|| "-".to_owned(), |tokens| tokens.to_string()),
+            usage
+                .cached_tokens
+                .map_or_else(String::new, |tokens| format!(" cached={tokens}")),
             info.principal(),
             if complete { "" } else { "  (incomplete)" },
         );
@@ -961,6 +965,7 @@ fn write_record(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         total_tokens: usage.total_tokens,
+        cached_tokens: usage.cached_tokens,
         complete,
         termination,
         error,
@@ -1189,7 +1194,7 @@ mod tests {
     #[tokio::test]
     async fn one_record_carries_metadata_and_token_counts() {
         let record = record_for(
-            r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}"#,
+            r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":9}}}"#,
         )
         .await;
 
@@ -1207,6 +1212,7 @@ mod tests {
         assert_eq!(record["input_tokens"], 12);
         assert_eq!(record["output_tokens"], 5);
         assert_eq!(record["total_tokens"], 17);
+        assert_eq!(record["cached_tokens"], 9);
         assert_eq!(record["complete"], true);
         assert!(record["started_at"].as_str().unwrap().ends_with('Z'));
         assert!(record["key_sha256"].as_str().unwrap().len() == 64);
@@ -1221,6 +1227,7 @@ mod tests {
         assert!(!line.contains("choices"));
         assert_eq!(record["input_tokens"], Value::Null);
         assert_eq!(record["output_tokens"], Value::Null);
+        assert_eq!(record["cached_tokens"], Value::Null);
         assert!(record["response_bytes"].as_u64().unwrap() > 0);
     }
 
@@ -1228,13 +1235,14 @@ mod tests {
     async fn streaming_usage_is_recovered_from_the_final_chunk() {
         let record = record_for(
             "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n\
-             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":8,\"total_tokens\":12}}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":8,\"total_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\n\
              data: [DONE]\n\n",
         )
         .await;
 
         assert_eq!(record["input_tokens"], 4);
         assert_eq!(record["output_tokens"], 8);
+        assert_eq!(record["cached_tokens"], 2);
     }
 
     #[test]
