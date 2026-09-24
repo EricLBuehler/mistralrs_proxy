@@ -9,7 +9,7 @@
 pub mod tui;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -19,6 +19,9 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 
 use serde::Deserialize;
+
+/// Bucket for an Open WebUI key's requests that carried no forwarded user.
+pub const UNATTRIBUTED: &str = "(unattributed)";
 
 /// One request record, as written by [`crate::logging`].
 ///
@@ -47,6 +50,9 @@ pub struct LogRecord {
     pub key_identifier: Option<String>,
     pub key_sha256: Option<String>,
     pub key_admin: Option<bool>,
+    pub openwebui_user_name: Option<String>,
+    pub openwebui_user_id: Option<String>,
+    pub openwebui_chat_id: Option<String>,
     pub backend_id: Option<String>,
     pub routing_policy: Option<String>,
     pub routing_reason: Option<String>,
@@ -73,13 +79,35 @@ pub struct LogRecord {
 
 impl LogRecord {
     /// `name[identifier]` for a known key, or a stand-in matching what the
-    /// terminal log prints.
+    /// terminal log prints. An attributed Open WebUI user is appended after a colon.
     pub fn principal(&self) -> String {
-        match (&self.key_name, &self.key_identifier, &self.key_sha256) {
+        let key = match (&self.key_name, &self.key_identifier, &self.key_sha256) {
             (Some(name), Some(identifier), _) => format!("{name}[{identifier}]"),
             (Some(name), None, _) => name.clone(),
             (None, _, Some(digest)) => format!("unknown[{}]", &digest[..8.min(digest.len())]),
             (None, _, None) => "anonymous".to_owned(),
+        };
+        match self.openwebui_user() {
+            Some(user) => format!("{key}:{user}"),
+            None => key,
+        }
+    }
+
+    /// The forwarded Open WebUI user, by display name when one was sent.
+    pub fn openwebui_user(&self) -> Option<&str> {
+        self.openwebui_user_name
+            .as_deref()
+            .or(self.openwebui_user_id.as_deref())
+    }
+
+    /// The key, or `key:user` for forwarded Open WebUI traffic; the rest of an `openwebui_keys` key
+    /// is `key:(unattributed)`.
+    pub fn principal_bucket(&self, openwebui_keys: &HashSet<String>) -> String {
+        let key = self.key_bucket();
+        match self.openwebui_user() {
+            Some(user) => format!("{key}:{user}"),
+            None if openwebui_keys.contains(key) => format!("{key}:{UNATTRIBUTED}"),
+            None => key.to_owned(),
         }
     }
 
@@ -110,6 +138,8 @@ impl LogRecord {
             self.termination.as_str(),
             self.key_name.as_deref().unwrap_or(""),
             self.key_identifier.as_deref().unwrap_or(""),
+            self.openwebui_user_name.as_deref().unwrap_or(""),
+            self.openwebui_user_id.as_deref().unwrap_or(""),
             self.auth_error.as_deref().unwrap_or(""),
             self.backend_id.as_deref().unwrap_or(""),
             self.routing_reason.as_deref().unwrap_or(""),
@@ -244,6 +274,10 @@ pub struct KeyTotals {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub prefilled_tokens: u64,
+    /// Start of the most recent request, or 0 when none carried a timestamp.
+    pub last_seen_unix_ms: u64,
+    /// Distinct Open WebUI users forwarded by this key; 0 for ordinary keys.
+    pub openwebui_users: usize,
 }
 
 /// Per-endpoint totals.
@@ -368,6 +402,11 @@ pub struct Summary {
     pub latency_ms: Distribution,
     /// Sorted by request count, descending.
     pub by_key: Vec<(String, KeyTotals)>,
+    /// Like `by_key`, but Open WebUI traffic is split out per forwarded user. Sorted by request
+    /// count, descending.
+    pub by_principal: Vec<(String, KeyTotals)>,
+    /// Keys that forwarded at least one Open WebUI user.
+    pub openwebui_keys: HashSet<String>,
     /// Sorted by request count, descending.
     pub by_path: Vec<(String, PathTotals)>,
     /// Routed requests sorted by backend request count, descending.
@@ -390,6 +429,13 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
         ..Summary::default()
     };
     let mut keys: HashMap<&str, KeyTotals> = HashMap::new();
+    let mut principals: HashMap<String, KeyTotals> = HashMap::new();
+    let mut key_users: HashMap<&str, HashSet<&str>> = HashMap::new();
+    summary.openwebui_keys = records
+        .iter()
+        .filter(|record| record.openwebui_user().is_some())
+        .map(|record| record.key_bucket().to_owned())
+        .collect();
     let mut paths: HashMap<&str, PathTotals> = HashMap::new();
     let mut backends: HashMap<&str, BackendAccumulator> = HashMap::new();
     let mut latencies = Vec::with_capacity(records.len());
@@ -456,14 +502,17 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
             per_token.push(record.duration_ms.saturating_mul(1_000) / tokens);
         }
 
-        let key = keys.entry(record.key_bucket()).or_default();
-        key.requests += 1;
-        key.errors += usize::from(record.is_error());
-        key.input_tokens = key.input_tokens.saturating_add(input);
-        key.output_tokens = key.output_tokens.saturating_add(output);
-        key.cached_tokens = key.cached_tokens.saturating_add(cached);
-        if record.input_tokens.is_some() {
-            key.prefilled_tokens = key.prefilled_tokens.saturating_add(prefilled);
+        let usage = (input, output, cached, prefilled);
+        add_request(keys.entry(record.key_bucket()).or_default(), record, usage);
+        add_request(
+            principals
+                .entry(record.principal_bucket(&summary.openwebui_keys))
+                .or_default(),
+            record,
+            usage,
+        );
+        if let Some(user) = record.openwebui_user() {
+            key_users.entry(record.key_bucket()).or_default().insert(user);
         }
 
         let path = paths.entry(record.path()).or_default();
@@ -514,7 +563,13 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
     summary.first_token_ms = Distribution::from_values(first_tokens);
     summary.per_output_token_us = Distribution::from_values(per_token);
 
+    for (key, users) in key_users {
+        if let Some(totals) = keys.get_mut(key) {
+            totals.openwebui_users = users.len();
+        }
+    }
     summary.by_key = sorted_by_requests(keys, |totals| totals.requests);
+    summary.by_principal = sorted_by_requests(principals, |totals| totals.requests);
     summary.by_path = sorted_by_requests(paths, |totals| totals.requests);
     summary.by_backend = backends
         .into_iter()
@@ -531,13 +586,26 @@ pub fn summarize(records: &[LogRecord]) -> Summary {
     summary
 }
 
-fn sorted_by_requests<T: Clone>(
-    map: HashMap<&str, T>,
+fn add_request(totals: &mut KeyTotals, record: &LogRecord, usage: (u64, u64, u64, u64)) {
+    let (input, output, cached, prefilled) = usage;
+    totals.requests += 1;
+    totals.errors += usize::from(record.is_error());
+    totals.input_tokens = totals.input_tokens.saturating_add(input);
+    totals.output_tokens = totals.output_tokens.saturating_add(output);
+    totals.cached_tokens = totals.cached_tokens.saturating_add(cached);
+    if record.input_tokens.is_some() {
+        totals.prefilled_tokens = totals.prefilled_tokens.saturating_add(prefilled);
+    }
+    totals.last_seen_unix_ms = totals.last_seen_unix_ms.max(record.started_at_unix_ms);
+}
+
+fn sorted_by_requests<K: Into<String>, T>(
+    map: HashMap<K, T>,
     requests: impl Fn(&T) -> usize,
 ) -> Vec<(String, T)> {
     let mut rows: Vec<(String, T)> = map
         .into_iter()
-        .map(|(name, totals)| (name.to_owned(), totals))
+        .map(|(name, totals)| (name.into(), totals))
         .collect();
     rows.sort_by(|left, right| {
         requests(&right.1)
@@ -698,9 +766,9 @@ pub fn summary_lines(path: &Path, summary: &Summary, malformed: u64) -> Vec<Stri
     lines.push(String::new());
     lines.push(format!(
         "  {:<24}{:>10}{:>12}{:>12}{:>12}{:>12}{:>7}",
-        "KEY", "REQUESTS", "IN", "CACHED", "PREFILLED", "OUT", "ERRORS"
+        "PRINCIPAL", "REQUESTS", "IN", "CACHED", "PREFILLED", "OUT", "ERRORS"
     ));
-    for (name, totals) in &summary.by_key {
+    for (name, totals) in &summary.by_principal {
         lines.push(format!(
             "  {:<24}{:>10}{:>12}{:>12}{:>12}{:>12}{:>7}",
             truncate(name, 23),
@@ -941,6 +1009,44 @@ mod tests {
         // The query string does not split the endpoint into two rows.
         assert_eq!(summary.by_path[0].0, "/v1/chat/completions");
         assert_eq!(summary.by_path[0].1.requests, 2);
+    }
+
+    #[test]
+    fn openwebui_traffic_splits_into_users_while_keys_count_them() {
+        let summary = summarize(&[
+            record(
+                r#"{"request_id":"1","started_at_unix_ms":10,"key_name":"webui","openwebui_user_name":"Ada","input_tokens":5,"status":200,"authorized":true,"complete":true}"#,
+            ),
+            record(
+                r#"{"request_id":"2","started_at_unix_ms":30,"key_name":"webui","openwebui_user_id":"u-2","status":200,"authorized":true,"complete":true}"#,
+            ),
+            record(
+                r#"{"request_id":"3","started_at_unix_ms":20,"key_name":"webui","status":200,"authorized":true,"complete":true}"#,
+            ),
+            record(
+                r#"{"request_id":"4","started_at_unix_ms":40,"key_name":"bob","status":200,"authorized":true,"complete":true}"#,
+            ),
+        ]);
+
+        let mut principals: Vec<&str> = summary
+            .by_principal
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        principals.sort_unstable();
+        assert_eq!(
+            principals,
+            ["bob", "webui:(unattributed)", "webui:Ada", "webui:u-2"]
+        );
+
+        let webui = &summary.by_key.iter().find(|(name, _)| name == "webui").unwrap().1;
+        assert_eq!(webui.requests, 3);
+        assert_eq!(webui.openwebui_users, 2);
+        assert_eq!(webui.last_seen_unix_ms, 30);
+        let bob = &summary.by_key.iter().find(|(name, _)| name == "bob").unwrap().1;
+        assert_eq!(bob.openwebui_users, 0);
+        assert!(summary.openwebui_keys.contains("webui"));
+        assert!(!summary.openwebui_keys.contains("bob"));
     }
 
     #[test]

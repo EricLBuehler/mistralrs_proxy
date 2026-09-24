@@ -44,16 +44,18 @@ pub fn explore(path: &Path, tail: Tail, records: Vec<LogRecord>) -> Result<(), B
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum View {
+    Users,
     Summary,
     Backends,
     Requests,
 }
 
 impl View {
-    const ALL: [Self; 3] = [Self::Summary, Self::Backends, Self::Requests];
+    const ALL: [Self; 4] = [Self::Users, Self::Summary, Self::Backends, Self::Requests];
 
     const fn title(self) -> &'static str {
         match self {
+            Self::Users => "Users",
             Self::Summary => "Summary",
             Self::Backends => "Backends",
             Self::Requests => "Requests",
@@ -62,9 +64,10 @@ impl View {
 
     const fn next(self) -> Self {
         match self {
+            Self::Users => Self::Summary,
             Self::Summary => Self::Backends,
             Self::Backends => Self::Requests,
-            Self::Requests => Self::Summary,
+            Self::Requests => Self::Users,
         }
     }
 }
@@ -82,6 +85,10 @@ struct App {
     needle: String,
     editing_filter: bool,
     errors_only: bool,
+    /// Row of the Users view.
+    user_selected: usize,
+    /// Principal chosen from the Users view; narrows Requests to exactly that bucket.
+    principal: Option<String>,
     /// Horizontal scroll offset for the tables of the current view; clamped
     /// at draw time, a no-op when the table fits.
     table_scroll: u16,
@@ -99,12 +106,14 @@ impl App {
             tail,
             records,
             summary,
-            view: View::Summary,
+            view: View::Users,
             selected: 0,
             selected_id: None,
             needle: String::new(),
             editing_filter: false,
             errors_only: false,
+            user_selected: 0,
+            principal: None,
             table_scroll: 0,
             status,
             quit: false,
@@ -146,6 +155,9 @@ impl App {
                 if appended.restarted || !appended.records.is_empty() {
                     self.records.extend(appended.records);
                     self.summary = summarize(&self.records);
+                    self.user_selected = self
+                        .user_selected
+                        .min(self.summary.by_principal.len().saturating_sub(1));
                     self.resolve_selection();
                 }
             }
@@ -170,6 +182,11 @@ impl App {
     /// The filtered records, newest first.
     fn visible(&self) -> Vec<&LogRecord> {
         let mut visible = filter(&self.records, &self.needle, self.errors_only);
+        if let Some(principal) = &self.principal {
+            visible.retain(|record| {
+                record.principal_bucket(&self.summary.openwebui_keys) == *principal
+            });
+        }
         visible.reverse();
 
         visible
@@ -201,6 +218,32 @@ impl App {
             return;
         }
 
+        if self.view == View::Users {
+            let last = self.summary.by_principal.len().saturating_sub(1);
+            let moved = match code {
+                KeyCode::Up | KeyCode::Char('k') => Some(self.user_selected.saturating_sub(1)),
+                KeyCode::Down | KeyCode::Char('j') => Some((self.user_selected + 1).min(last)),
+                KeyCode::PageUp => Some(self.user_selected.saturating_sub(10)),
+                KeyCode::PageDown => Some((self.user_selected + 10).min(last)),
+                KeyCode::Home | KeyCode::Char('g') => Some(0),
+                KeyCode::End | KeyCode::Char('G') => Some(last),
+                _ => None,
+            };
+            if let Some(index) = moved {
+                self.user_selected = index;
+                return;
+            }
+            if code == KeyCode::Enter {
+                if let Some((principal, _)) = self.summary.by_principal.get(self.user_selected) {
+                    self.status = format!("Requests for {principal}; Esc shows everyone.");
+                    self.principal = Some(principal.clone());
+                    self.view = View::Requests;
+                    self.select(0);
+                }
+                return;
+            }
+        }
+
         let last = self.visible().len().saturating_sub(1);
         match code {
             KeyCode::Tab => self.view = self.view.next(),
@@ -212,9 +255,10 @@ impl App {
                 self.table_scroll =
                     self.table_scroll.saturating_add(crate::render::SCROLL_STEP);
             }
-            KeyCode::Char('1') => self.view = View::Summary,
-            KeyCode::Char('2') => self.view = View::Backends,
-            KeyCode::Char('3') => self.view = View::Requests,
+            KeyCode::Char('1') => self.view = View::Users,
+            KeyCode::Char('2') => self.view = View::Summary,
+            KeyCode::Char('3') => self.view = View::Backends,
+            KeyCode::Char('4') => self.view = View::Requests,
             KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => self.select((self.selected + 1).min(last)),
             KeyCode::PageUp => self.select(self.selected.saturating_sub(10)),
@@ -239,6 +283,11 @@ impl App {
             KeyCode::Char('r') => {
                 self.refresh();
                 self.status = format!("{} records", thousands(self.records.len() as u64));
+            }
+            KeyCode::Esc if self.view == View::Requests && self.principal.is_some() => {
+                self.principal = None;
+                self.status = "Showing requests from everyone.".to_owned();
+                self.select(0);
             }
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             _ => {}
@@ -303,6 +352,7 @@ impl App {
         );
 
         match self.view {
+            View::Users => self.draw_users(frame, body),
             View::Summary => self.draw_summary(frame, body),
             View::Backends => self.draw_backends(frame, body),
             View::Requests => self.draw_requests(frame, body),
@@ -311,13 +361,23 @@ impl App {
         let help = if self.editing_filter {
             format!("filter: {}_", self.needle)
         } else {
-            let scope = match (self.needle.is_empty(), self.errors_only) {
+            let mut scope = match (self.needle.is_empty(), self.errors_only) {
                 (true, false) => String::new(),
                 (true, true) => "  [errors only]".to_owned(),
                 (false, false) => format!("  [/{}]", self.needle),
                 (false, true) => format!("  [/{} + errors]", self.needle),
             };
-            format!("tab views   ↑/↓ move   ←/→ scroll   / filter   e errors   r refresh   q quit{scope}")
+            if let Some(principal) = &self.principal {
+                scope.push_str(&format!("  [{principal}]"));
+            }
+            let enter = if self.view == View::Users {
+                "   enter requests"
+            } else {
+                ""
+            };
+            format!(
+                "tab views   ↑/↓ move   ←/→ scroll{enter}   / filter   e errors   r refresh   q quit{scope}"
+            )
         };
         let help_style = if self.editing_filter {
             Style::default().fg(Color::Black).bg(Color::Yellow)
@@ -398,10 +458,9 @@ impl App {
         ];
 
         let rows = percentile_rows(summary);
-        let [overview_area, percentiles_area, keys_area, paths_area] = Layout::vertical([
+        let [overview_area, percentiles_area, paths_area] = Layout::vertical([
             Constraint::Length(overview.len() as u16 + 1),
             Constraint::Length(rows.len() as u16 + 2),
-            Constraint::Fill(1),
             Constraint::Fill(1),
         ])
         .areas(area);
@@ -435,29 +494,6 @@ impl App {
         );
         frame.render_widget(percentiles, percentiles_area.inner(Margin::new(1, 0)));
 
-        let key_rows = summary.by_key.iter().map(|(name, totals)| {
-            Row::new(vec![
-                Cell::from(truncate(name, 22)),
-                Cell::from(thousands(totals.requests as u64)),
-                Cell::from(thousands(totals.input_tokens)),
-                Cell::from(thousands(totals.cached_tokens)),
-                Cell::from(thousands(totals.prefilled_tokens)),
-                Cell::from(thousands(totals.output_tokens)),
-                Cell::from(totals.errors.to_string()),
-            ])
-        });
-        {
-            let mut state = TableState::default();
-            crate::render::render_scrolled_table(
-                frame,
-                totals_table(key_rows, "KEY"),
-                keys_area.inner(Margin::new(1, 0)),
-                TOTALS_TABLE_WIDTH,
-                self.table_scroll,
-                &mut state,
-            );
-        }
-
         let path_rows = summary.by_path.iter().map(|(path, totals)| {
             Row::new(vec![
                 Cell::from(truncate(path, 22)),
@@ -480,6 +516,39 @@ impl App {
                 &mut state,
             );
         }
+    }
+
+    fn draw_users(&self, frame: &mut Frame, area: Rect) {
+        let rows = self.summary.by_principal.iter().map(|(name, totals)| {
+            Row::new(vec![
+                Cell::from(truncate(name, 22)),
+                Cell::from(thousands(totals.requests as u64)),
+                Cell::from(thousands(totals.input_tokens)),
+                Cell::from(thousands(totals.cached_tokens)),
+                Cell::from(thousands(totals.prefilled_tokens)),
+                Cell::from(thousands(totals.output_tokens)),
+                Cell::from(totals.errors.to_string()),
+            ])
+        });
+        let table = totals_table(rows, "PRINCIPAL")
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+        let mut state = TableState::default().with_selected(
+            (!self.summary.by_principal.is_empty()).then_some(self.user_selected),
+        );
+        crate::render::render_scrolled_table(
+            frame,
+            table,
+            area.inner(Margin::new(1, 0)),
+            TOTALS_TABLE_WIDTH,
+            self.table_scroll,
+            &mut state,
+        );
     }
 
     fn draw_backends(&self, frame: &mut Frame, area: Rect) {
@@ -579,7 +648,10 @@ impl App {
                 Cell::from(clock(&record.started_at)),
                 Cell::from(record.method.clone()),
                 Cell::from(truncate(record.path(), 27)),
-                Cell::from(truncate(&record.principal(), 21)),
+                Cell::from(truncate(
+                    &record.principal_bucket(&self.summary.openwebui_keys),
+                    21,
+                )),
                 Cell::from(truncate(record.backend_id.as_deref().unwrap_or("-"), 15)),
                 Cell::from(
                     record
@@ -610,7 +682,7 @@ impl App {
         )
         .header(
             Row::new(vec![
-                "TIME", "METHOD", "ENDPOINT", "KEY", "BACKEND", "STATUS", "TOOK", "IN", "CACHED",
+                "TIME", "METHOD", "ENDPOINT", "PRINCIPAL", "BACKEND", "STATUS", "TOOK", "IN", "CACHED",
                 "OUT",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
@@ -708,8 +780,12 @@ fn detail_lines(record: &LogRecord) -> Vec<Line<'static>> {
         Line::from(vec![
             label("key     "),
             Span::raw(format!(
-                "{}  digest {}  admin {}",
+                "{}{}  digest {}  admin {}",
                 record.principal(),
+                record
+                    .openwebui_chat_id
+                    .as_deref()
+                    .map_or_else(String::new, |chat| format!("  chat {chat}")),
                 record
                     .key_sha256
                     .as_deref()
@@ -857,13 +933,14 @@ mod tests {
 
     #[test]
     fn the_summary_view_shows_totals_and_breakdowns() {
-        let screen = rendered(&sample_app());
+        let mut app = sample_app();
+        app.handle(KeyCode::Char('2'));
+        let screen = rendered(&app);
 
         assert!(screen.contains("Summary"), "{screen}");
         assert!(screen.contains("requests"), "{screen}");
         assert!(screen.contains("1,234 in"), "{screen}");
-        assert!(screen.contains("alice"), "{screen}");
-        assert!(screen.contains("(unauthenticated)"), "{screen}");
+        assert!(!screen.contains("PRINCIPAL"), "{screen}");
         assert!(screen.contains("/v1/chat/completions"), "{screen}");
         assert!(screen.contains("2 requests"), "{screen}");
         assert!(screen.contains("P50"), "{screen}");
@@ -879,7 +956,7 @@ mod tests {
     #[test]
     fn the_backends_view_shows_routing_share_and_latency() {
         let mut app = sample_app();
-        app.handle(KeyCode::Char('2'));
+        app.handle(KeyCode::Char('3'));
 
         // At the default scroll the left and middle columns are in view...
         let screen = rendered(&app);
@@ -905,13 +982,14 @@ mod tests {
     #[test]
     fn the_requests_view_lists_rows_and_details_the_selection() {
         let mut app = sample_app();
-        app.handle(KeyCode::Char('3'));
+        app.handle(KeyCode::Char('4'));
 
         let screen = rendered(&app);
 
         assert!(screen.contains("ENDPOINT"), "{screen}");
         assert!(screen.contains("10:00:05.000"), "{screen}");
-        assert!(screen.contains("alice[AAAAAAAA]"), "{screen}");
+        assert!(screen.contains("alice"), "{screen}");
+        assert!(screen.contains("PRINCIPAL"), "{screen}");
         assert!(screen.contains("selected request"), "{screen}");
         // Newest first, so the 401 is selected and detailed.
         assert!(
@@ -924,12 +1002,13 @@ mod tests {
     #[test]
     fn moving_down_selects_the_older_record() {
         let mut app = sample_app();
-        app.handle(KeyCode::Char('3'));
+        app.handle(KeyCode::Char('4'));
         app.handle(KeyCode::Down);
 
         let screen = rendered(&app);
 
         assert_eq!(app.selected, 1);
+        assert!(screen.contains("alice[AAAAAAAA]"), "{screen}");
         assert!(screen.contains("openai-python/1.2.3"), "{screen}");
         assert!(screen.contains("streaming"), "{screen}");
         assert!(screen.contains("1,234 in"), "{screen}");
@@ -973,7 +1052,7 @@ mod tests {
     #[test]
     fn an_empty_log_renders_without_panicking() {
         let mut app = app_with("");
-        app.handle(KeyCode::Char('3'));
+        app.handle(KeyCode::Char('4'));
 
         let screen = rendered(&app);
 
@@ -984,14 +1063,16 @@ mod tests {
     #[test]
     fn tab_cycles_the_views_and_q_quits() {
         let mut app = sample_app();
-        assert_eq!(app.view, View::Summary);
+        assert_eq!(app.view, View::Users);
 
+        app.handle(KeyCode::Tab);
+        assert_eq!(app.view, View::Summary);
         app.handle(KeyCode::Tab);
         assert_eq!(app.view, View::Backends);
         app.handle(KeyCode::Tab);
         assert_eq!(app.view, View::Requests);
         app.handle(KeyCode::Tab);
-        assert_eq!(app.view, View::Summary);
+        assert_eq!(app.view, View::Users);
 
         app.handle(KeyCode::Char('q'));
         assert!(app.quit);
@@ -1009,7 +1090,7 @@ mod tests {
         let mut tail = Tail::new(&path);
         let records = tail.poll().unwrap().records;
         let mut app = App::new(path.clone(), tail, records);
-        app.handle(KeyCode::Char('3'));
+        app.handle(KeyCode::Char('4'));
         app.select(0);
         assert_eq!(app.selected_id.as_deref(), Some("old"));
 
@@ -1031,5 +1112,88 @@ mod tests {
         assert_eq!(app.selected, 1, "the selection should follow its record");
         assert_eq!(app.visible()[app.selected].request_id, "old");
     }
-}
 
+    fn openwebui_app() -> App {
+        app_with(concat!(
+            r#"{"request_id":"w1","started_at_unix_ms":1,"key_name":"webui","key_identifier":"WWWWWWWW","openwebui_user_name":"José Doe","openwebui_user_id":"u-1","openwebui_chat_id":"c-1","status":200,"authorized":true,"complete":true,"input_tokens":10,"output_tokens":2}"#,
+            "\n",
+            r#"{"request_id":"w2","started_at_unix_ms":2,"key_name":"webui","key_identifier":"WWWWWWWW","openwebui_user_name":"José Doe","openwebui_user_id":"u-1","status":200,"authorized":true,"complete":true}"#,
+            "\n",
+            r#"{"request_id":"w3","started_at_unix_ms":3,"key_name":"webui","key_identifier":"WWWWWWWW","status":200,"authorized":true,"complete":true}"#,
+            "\n",
+            r#"{"request_id":"a1","started_at_unix_ms":4,"key_name":"alice","key_identifier":"AAAAAAAA","status":200,"authorized":true,"complete":true}"#,
+            "\n",
+        ))
+    }
+
+    #[test]
+    fn the_users_view_lists_keys_and_openwebui_users_as_peers() {
+        let app = openwebui_app();
+
+        let screen = rendered(&app);
+
+        assert!(screen.contains("Users"), "{screen}");
+        assert!(screen.contains("PRINCIPAL"), "{screen}");
+        assert!(screen.contains("webui:José Doe"), "{screen}");
+        assert!(screen.contains("webui:(unattributed)"), "{screen}");
+        assert!(screen.contains("alice"), "{screen}");
+        assert!(screen.contains("enter requests"), "{screen}");
+        // Attributed traffic replaces the bare key row.
+        let principals: Vec<&str> = app
+            .summary
+            .by_principal
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(!principals.contains(&"webui"), "{principals:?}");
+    }
+
+    #[test]
+    fn enter_on_a_user_shows_only_their_requests_and_esc_shows_everyone() {
+        let mut app = openwebui_app();
+        assert_eq!(app.summary.by_principal[0].0, "webui:José Doe");
+
+        app.handle(KeyCode::Enter);
+
+        assert_eq!(app.view, View::Requests);
+        let ids: Vec<&str> = app
+            .visible()
+            .iter()
+            .map(|record| record.request_id.as_str())
+            .collect();
+        assert_eq!(ids, ["w2", "w1"]);
+        let screen = rendered(&app);
+        assert!(screen.contains("[webui:José Doe]"), "{screen}");
+        assert!(screen.contains("webui:José Doe  "), "{screen}");
+        app.handle(KeyCode::Down);
+        let screen = rendered(&app);
+        assert!(screen.contains("chat c-1"), "{screen}");
+
+        app.handle(KeyCode::Esc);
+
+        assert!(!app.quit);
+        assert!(app.principal.is_none());
+        assert_eq!(app.visible().len(), 4);
+    }
+
+    #[test]
+    fn the_unattributed_bucket_filters_to_the_key_without_users() {
+        let mut app = openwebui_app();
+        let index = app
+            .summary
+            .by_principal
+            .iter()
+            .position(|(name, _)| name == "webui:(unattributed)")
+            .unwrap();
+        app.user_selected = index;
+
+        app.handle(KeyCode::Enter);
+
+        let ids: Vec<&str> = app
+            .visible()
+            .iter()
+            .map(|record| record.request_id.as_str())
+            .collect();
+        assert_eq!(ids, ["w3"]);
+    }
+}

@@ -9,7 +9,7 @@ use std::{
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout, Margin, Rect},
+    layout::{Constraint, Layout, Margin},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Paragraph, Row, Table, TableState},
@@ -17,9 +17,16 @@ use ratatui::{
 
 use crate::{
     keys::{KeyFile, KeyRecord},
-    logging::format_timestamp,
+    logging::{format_timestamp, now_unix_ms},
     logs::{self, thousands, KeyTotals},
 };
+
+const SECOND_MS: u64 = 1_000;
+const MINUTE_MS: u64 = 60 * SECOND_MS;
+const HOUR_MS: u64 = 60 * MINUTE_MS;
+const DAY_MS: u64 = 24 * HOUR_MS;
+/// `YYYY-MM-DD` prefix of an ISO-8601 timestamp.
+const CREATED_DATE_CHARS: usize = 10;
 
 /// Issue a key, append it to the database, and print it once.
 ///
@@ -84,8 +91,8 @@ pub fn manage(path: &Path, log_file: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Per-key token totals from the audit log, for the usage panel. `None` when
-/// the log does not exist; an empty log simply yields an empty table.
+/// Per-key totals from the audit log, for the usage columns. `None` when the log
+/// does not exist; an empty log simply leaves the columns blank.
 fn read_key_usage(log_file: &Path) -> Option<Vec<(String, KeyTotals)>> {
     if !log_file.exists() {
         return None;
@@ -104,8 +111,7 @@ enum Mode {
 struct App<'a> {
     path: &'a Path,
     log_file: &'a Path,
-    /// Per-key token usage from the audit log, or `None` when the log is
-    /// missing and the usage panel says so.
+    /// Per-key usage from the audit log, or `None` when the log is missing.
     usage: Option<Vec<(String, KeyTotals)>>,
     file: KeyFile,
     selected: usize,
@@ -124,6 +130,7 @@ impl<'a> App<'a> {
         log_file: &'a Path,
         usage: Option<Vec<(String, KeyTotals)>>,
     ) -> Self {
+        let has_log = usage.is_some();
         Self {
             path,
             log_file,
@@ -132,7 +139,14 @@ impl<'a> App<'a> {
             selected: 0,
             dirty: false,
             saved: false,
-            status: format!("Loaded {}", path.display()),
+            status: if has_log {
+                format!("Loaded {}", path.display())
+            } else {
+                format!(
+                    "No audit log (pass --log-file); usage columns are empty: {}",
+                    log_file.display()
+                )
+            },
             table_scroll: 0,
             mode: Mode::Browse,
             quit: false,
@@ -306,9 +320,8 @@ impl<'a> App<'a> {
     }
 
     fn draw(&self, frame: &mut Frame) {
-        let [header, keys_area, usage_area, footer, status] = Layout::vertical([
+        let [header, keys_area, footer, status] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Min(3),
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -335,7 +348,9 @@ impl<'a> App<'a> {
             header,
         );
 
+        let now = now_unix_ms();
         let rows = self.file.keys.iter().map(|key| {
+            let usage = self.usage_of(&key.name);
             let style = if key.disabled {
                 Style::default().fg(Color::DarkGray)
             } else {
@@ -346,10 +361,27 @@ impl<'a> App<'a> {
                 Cell::from(key.identifier.clone()),
                 Cell::from(if key.admin { "yes" } else { "no" }),
                 Cell::from(if key.disabled { "DISABLED" } else { "active" }),
+                Cell::from(
+                    usage
+                        .filter(|usage| usage.last_seen_unix_ms > 0)
+                        .map_or_else(|| "-".to_owned(), |usage| ago(now, usage.last_seen_unix_ms)),
+                ),
+                Cell::from(usage.map_or_else(
+                    || "-".to_owned(),
+                    |usage| thousands(usage.input_tokens.saturating_add(usage.output_tokens)),
+                )),
+                Cell::from(
+                    usage
+                        .filter(|usage| usage.openwebui_users > 0)
+                        .map_or_else(String::new, |usage| usage.openwebui_users.to_string()),
+                ),
                 Cell::from(if key.created_at_unix_ms == 0 {
                     "unknown".to_owned()
                 } else {
                     format_timestamp(key.created_at_unix_ms)
+                        .chars()
+                        .take(CREATED_DATE_CHARS)
+                        .collect()
                 }),
                 Cell::from(key.key_sha256.chars().take(16).collect::<String>()),
             ])
@@ -362,7 +394,10 @@ impl<'a> App<'a> {
                 Constraint::Length(10),
                 Constraint::Length(5),
                 Constraint::Length(8),
-                Constraint::Length(24),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(5),
+                Constraint::Length(10),
                 Constraint::Min(16),
             ],
         )
@@ -372,6 +407,9 @@ impl<'a> App<'a> {
                 "IDENTIFIER",
                 "ADMIN",
                 "STATE",
+                "LAST USED",
+                "TOKENS",
+                "USERS",
                 "CREATED",
                 "SHA-256",
             ])
@@ -395,8 +433,6 @@ impl<'a> App<'a> {
             self.table_scroll,
             &mut state,
         );
-
-        self.draw_usage(frame, usage_area);
 
         let help = match self.mode {
             Mode::Browse => {
@@ -424,65 +460,29 @@ impl<'a> App<'a> {
         );
     }
 
-    /// The per-key token panel, fed by the audit log rather than the key file.
-    fn draw_usage(&self, frame: &mut Frame, area: Rect) {
-        let title = format!(" key usage · {} ", self.log_file.display());
-        let table = match &self.usage {
-            None => {
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        "no audit log found; pass --log-file to show per-key token usage",
-                        Style::default().fg(Color::DarkGray),
-                    )))
-                    .block(Block::new().title(title)),
-                    area.inner(Margin::new(1, 0)),
-                );
-                return;
-            }
-            Some(rows) => Table::new(
-                rows.iter().map(|(name, totals)| {
-                    Row::new(vec![
-                        Cell::from(logs::truncate(name, 21)),
-                        Cell::from(thousands(totals.requests as u64)),
-                        Cell::from(thousands(totals.input_tokens)),
-                        Cell::from(thousands(totals.cached_tokens)),
-                        Cell::from(thousands(totals.prefilled_tokens)),
-                        Cell::from(thousands(totals.output_tokens)),
-                    ])
-                }),
-                [
-                    Constraint::Length(22),
-                    Constraint::Length(10),
-                    Constraint::Length(12),
-                    Constraint::Length(12),
-                    Constraint::Length(12),
-                    Constraint::Length(12),
-                ],
-            )
-            .header(
-                Row::new(vec!["KEY", "REQUESTS", "IN", "CACHED", "PREFILLED", "OUT"])
-                    .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-            )
-            .block(Block::new().title(title)),
-        };
+    fn usage_of(&self, name: &str) -> Option<&KeyTotals> {
+        self.usage
+            .as_ref()?
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, totals)| totals)
+    }
+}
 
-        let mut state = TableState::default();
-        crate::render::render_scrolled_table(
-            frame,
-            table,
-            area.inner(Margin::new(1, 0)),
-            USAGE_TABLE_WIDTH,
-            self.table_scroll,
-            &mut state,
-        );
+/// How long before `now` something happened, in the largest whole unit.
+fn ago(now: u64, then: u64) -> String {
+    let elapsed = now.saturating_sub(then);
+    match elapsed {
+        _ if elapsed < MINUTE_MS => format!("{}s ago", elapsed / SECOND_MS),
+        _ if elapsed < HOUR_MS => format!("{}m ago", elapsed / MINUTE_MS),
+        _ if elapsed < DAY_MS => format!("{}h ago", elapsed / HOUR_MS),
+        _ => format!("{}d ago", elapsed / DAY_MS),
     }
 }
 
 /// Natural width of the keys table (columns + spacing + symbol slot; the
 /// trailing SHA column is the stretchable one).
-const KEYS_TABLE_WIDTH: u16 = 94;
-/// Natural width of the key usage table.
-const USAGE_TABLE_WIDTH: u16 = 89;
+const KEYS_TABLE_WIDTH: u16 = 108;
 
 #[cfg(test)]
 mod tests {
@@ -516,40 +516,56 @@ mod tests {
     }
 
     #[test]
-    fn the_usage_panel_shows_per_key_cache_stats() {
-        let (file, path) = app_with(&[("alice", true)]);
+    fn the_keys_table_shows_usage_columns_from_the_log() {
+        let (file, path) = app_with(&[("alice", true), ("webui", false)]);
         let log = scratch().with_extension("jsonl");
         // A JSONL record must be a single line.
         std::fs::write(
             &log,
             concat!(
-                r#"{"request_id":"1","started_at":"2026-08-20T10:00:00.000Z","started_at_unix_ms":1,"duration_ms":10,"method":"POST","uri":"/v1/chat/completions","key_name":"alice","key_identifier":"AAAAAAAA","status":200,"authorized":true,"input_tokens":1000,"output_tokens":50,"cached_tokens":800,"complete":true,"termination":"complete"}"#,
-                "\n"
+                r#"{"request_id":"1","started_at_unix_ms":1,"key_name":"alice","status":200,"authorized":true,"input_tokens":1000,"output_tokens":50,"complete":true,"termination":"complete"}"#,
+                "\n",
+                r#"{"request_id":"2","started_at_unix_ms":2,"key_name":"webui","openwebui_user_name":"Ada","status":200,"authorized":true,"complete":true,"termination":"complete"}"#,
+                "\n",
+                r#"{"request_id":"3","started_at_unix_ms":3,"key_name":"webui","openwebui_user_name":"Grace","status":200,"authorized":true,"complete":true,"termination":"complete"}"#,
+                "\n",
             ),
         )
         .unwrap();
 
         let app = App::new(file, &path, &log, read_key_usage(&log));
+        std::fs::remove_file(&log).unwrap();
         let screen = rendered(&app);
 
-        assert!(screen.contains("key usage"), "{screen}");
-        assert!(screen.contains("CACHED"), "{screen}");
-        assert!(screen.contains("PREFILLED"), "{screen}");
-        assert!(screen.contains("800"), "{screen}");
-        assert!(screen.contains("200"), "{screen}");
-        assert!(screen.contains("alice"), "{screen}");
+        assert!(screen.contains("LAST USED"), "{screen}");
+        assert!(screen.contains("TOKENS"), "{screen}");
+        assert!(screen.contains("USERS"), "{screen}");
+        assert!(screen.contains("1,050"), "{screen}");
+        assert!(screen.contains("d ago"), "{screen}");
+        assert!(!screen.contains("key usage"), "{screen}");
+        let webui = app.usage_of("webui").unwrap();
+        assert_eq!(webui.openwebui_users, 2);
     }
 
     #[test]
-    fn the_usage_panel_notes_a_missing_audit_log() {
+    fn a_missing_audit_log_is_noted_in_the_status_line() {
         let (file, path) = app_with(&[("alice", true)]);
         let missing = std::env::temp_dir().join("definitely-absent-key-usage.jsonl");
 
         let app = App::new(file, &path, &missing, read_key_usage(&missing));
         let screen = rendered(&app);
 
-        assert!(screen.contains("no audit log found"), "{screen}");
+        assert!(screen.contains("No audit log"), "{screen}");
         assert!(screen.contains("--log-file"), "{screen}");
+    }
+
+    #[test]
+    fn ago_uses_the_largest_whole_unit() {
+        assert_eq!(ago(90 * SECOND_MS, 60 * SECOND_MS), "30s ago");
+        assert_eq!(ago(5 * MINUTE_MS, 0), "5m ago");
+        assert_eq!(ago(3 * HOUR_MS, 0), "3h ago");
+        assert_eq!(ago(2 * DAY_MS, 0), "2d ago");
+        assert_eq!(ago(0, 10), "0s ago");
     }
 
     #[test]
