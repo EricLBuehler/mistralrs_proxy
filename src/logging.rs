@@ -32,7 +32,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use axum::{
     body::Body,
     http::{
-        Method, StatusCode, Uri, Version,
+        HeaderMap, Method, StatusCode, Uri, Version,
         header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, USER_AGENT},
         request, response,
     },
@@ -57,6 +57,9 @@ const AUDIT_REQUEST_SLOTS: usize = 4_096;
 // that terminal events for admitted requests never need to block a Tokio
 // worker, even while the log sink is stalled.
 const MAX_EVENTS_PER_REQUEST: usize = 5;
+const OPENWEBUI_USER_NAME_HEADER: &str = "x-openwebui-user-name";
+const OPENWEBUI_USER_ID_HEADER: &str = "x-openwebui-user-id";
+const OPENWEBUI_CHAT_ID_HEADER: &str = "x-openwebui-chat-id";
 
 /// Handle used by the request path to report events. Cloning is cheap.
 #[derive(Clone)]
@@ -148,6 +151,15 @@ pub struct RequestInfo {
     pub identity: Option<Arc<KeyIdentity>>,
     pub authorized: bool,
     pub auth_error: Option<&'static str>,
+    pub openwebui_user: Option<OpenWebUiUser>,
+}
+
+/// The Open WebUI user a request was made for, as forwarded by the trusted Open WebUI key.
+#[derive(Debug)]
+pub struct OpenWebUiUser {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub chat_id: Option<String>,
 }
 
 impl RequestInfo {
@@ -167,14 +179,47 @@ impl RequestInfo {
             identity: auth.identity.clone(),
             authorized: auth.result.is_ok(),
             auth_error: auth.result.err().map(|error| error.code()),
+            openwebui_user: None,
         }
+    }
+
+    /// Trust the `X-OpenWebUI-*` user headers only on requests authorized by `key_name`; any
+    /// other key could forge them.
+    pub fn with_openwebui_user(mut self, headers: &HeaderMap, key_name: Option<&str>) -> Self {
+        let trusted = self.authorized
+            && key_name.is_some_and(|key_name| {
+                self.identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.name == key_name)
+            });
+        if !trusted {
+            return self;
+        }
+        let user = OpenWebUiUser {
+            // Open WebUI percent-encodes the display name.
+            name: header_string(headers.get(OPENWEBUI_USER_NAME_HEADER))
+                .map(|name| percent_decode(&name)),
+            id: header_string(headers.get(OPENWEBUI_USER_ID_HEADER)),
+            chat_id: header_string(headers.get(OPENWEBUI_CHAT_ID_HEADER)),
+        };
+        if user.name.is_some() || user.id.is_some() {
+            self.openwebui_user = Some(user);
+        }
+        self
     }
 
     /// `name[identifier]` for a known key, or a stable stand-in when the key is
     /// unknown or absent.
     fn principal(&self) -> String {
         match (&self.identity, &self.key_sha256) {
-            (Some(identity), _) => format!("{}[{}]", identity.name, identity.identifier),
+            (Some(identity), _) => match self
+                .openwebui_user
+                .as_ref()
+                .and_then(|user| user.name.as_deref().or(user.id.as_deref()))
+            {
+                Some(user) => format!("{}[{}]:{user}", identity.name, identity.identifier),
+                None => format!("{}[{}]", identity.name, identity.identifier),
+            },
             (None, Some(digest)) => format!("unknown[{}]", &digest[..8.min(digest.len())]),
             (None, None) => "anonymous".to_owned(),
         }
@@ -183,6 +228,29 @@ impl RequestInfo {
 
 fn header_string(value: Option<&axum::http::HeaderValue>) -> Option<String> {
     value.map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 enum LogEvent {
@@ -848,6 +916,9 @@ struct RequestRecord<'a> {
     key_identifier: Option<&'a str>,
     key_sha256: Option<&'a str>,
     key_admin: Option<bool>,
+    openwebui_user_name: Option<&'a str>,
+    openwebui_user_id: Option<&'a str>,
+    openwebui_chat_id: Option<&'a str>,
     backend_id: Option<&'a str>,
     routing_policy: Option<&'static str>,
     routing_reason: Option<&'static str>,
@@ -939,6 +1010,18 @@ fn write_record(
             .map(|identity| identity.identifier.as_str()),
         key_sha256: info.key_sha256.as_deref(),
         key_admin: info.identity.as_ref().map(|identity| identity.admin),
+        openwebui_user_name: info
+            .openwebui_user
+            .as_ref()
+            .and_then(|user| user.name.as_deref()),
+        openwebui_user_id: info
+            .openwebui_user
+            .as_ref()
+            .and_then(|user| user.id.as_deref()),
+        openwebui_chat_id: info
+            .openwebui_user
+            .as_ref()
+            .and_then(|user| user.chat_id.as_deref()),
         backend_id: routing.and_then(|routing| routing.backend_id.as_deref()),
         routing_policy: routing.and_then(|routing| routing.routing_policy),
         routing_reason: routing.and_then(|routing| routing.routing_reason),

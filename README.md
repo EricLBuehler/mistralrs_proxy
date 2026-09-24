@@ -108,6 +108,21 @@ issued by the page are persisted and become usable immediately. Changes made
 with the CLI key manager still require a restart; do not run the key manager
 while the server is accepting registrations.
 
+To attribute Open WebUI traffic to individual users, create a key for Open
+WebUI, start Open WebUI with `ENABLE_FORWARD_USER_INFO_HEADERS=true`, and name
+that key in `runtime.toml`:
+
+```toml
+[openwebui]
+key_name = "webui"
+```
+
+Requests authorized by that key record the forwarded `X-OpenWebUI-User-Name`,
+`X-OpenWebUI-User-Id`, and `X-OpenWebUI-Chat-Id` values as
+`openwebui_user_name`, `openwebui_user_id`, and `openwebui_chat_id` in the audit
+log. The headers are ignored on every other key, since any client could send
+them.
+
 If no backend is eligible, clients receive a generic `503 service_unavailable`
 response with `Retry-After: 1`; private topology and connection details remain
 in the audit log. Run `mistralrs_proxy serve --help` for the full option list.

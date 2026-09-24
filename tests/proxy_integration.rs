@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use mistralrs_proxy::runtime::{Backend, OpenWebUiConfig, RuntimeConfig, RuntimeState};
 use support::{Proxy, Upstream, http_client, key_store, one_key, record_for, unbound_addr};
 
 const UPSTREAM_BODY: &str = concat!(
@@ -435,4 +436,56 @@ async fn a_client_that_disconnects_before_the_response_is_still_recorded() {
     assert_eq!(record["status"], Value::Null);
     assert_eq!(record["complete"], false);
     assert_eq!(record["termination"], "client_disconnected");
+}
+
+#[tokio::test]
+async fn openwebui_user_headers_are_logged_only_for_the_configured_key() {
+    let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+    let upstream = Upstream::start(
+        Router::new()
+            .fallback(upstream_handler)
+            .with_state(observed_tx),
+    )
+    .await;
+    let (keys, issued) = key_store(&[("webui", false, false), ("bob", false, false)]);
+    let mut config = RuntimeConfig::new(vec![Backend::new("test", upstream.uri("/internal"))]);
+    config.openwebui = OpenWebUiConfig {
+        key_name: Some("webui".to_owned()),
+    };
+    let proxy = Proxy::start_with_backends(RuntimeState::from_config(config), keys).await;
+
+    let client = http_client();
+    let mut ids = Vec::new();
+    for key in &issued {
+        let request = Request::builder()
+            .method("POST")
+            .uri(proxy.url("/v1/chat/completions"))
+            .header(header::AUTHORIZATION, format!("Bearer {}", key.secret))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-OpenWebUI-User-Name", "Jos%C3%A9 Doe")
+            .header("X-OpenWebUI-User-Id", "3f6c1a2e-user")
+            .header("X-OpenWebUI-Chat-Id", "9b1d-chat")
+            .body(Body::from(r#"{"messages":[]}"#))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        ids.push(request_id(&response));
+        response.into_body().collect().await.unwrap();
+    }
+
+    drop(client);
+    let records = proxy.stop().await;
+    upstream.stop().await;
+
+    let trusted = record_for(&records, &ids[0]);
+    assert_eq!(trusted["key_name"], "webui");
+    assert_eq!(trusted["openwebui_user_name"], "José Doe");
+    assert_eq!(trusted["openwebui_user_id"], "3f6c1a2e-user");
+    assert_eq!(trusted["openwebui_chat_id"], "9b1d-chat");
+
+    let forged = record_for(&records, &ids[1]);
+    assert_eq!(forged["key_name"], "bob");
+    assert_eq!(forged["openwebui_user_name"], Value::Null);
+    assert_eq!(forged["openwebui_user_id"], Value::Null);
+    assert_eq!(forged["openwebui_chat_id"], Value::Null);
 }

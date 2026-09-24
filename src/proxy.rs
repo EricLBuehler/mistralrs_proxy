@@ -101,12 +101,12 @@ async fn proxy(
     let request_id = Uuid::new_v4();
     let (parts, body) = request.into_parts();
     let authentication = authenticate(&parts.headers, &state.keys);
+    let openwebui = state.runtime.openwebui();
+    let info = RequestInfo::new(peer, &parts, &authentication)
+        .with_openwebui_user(&parts.headers, openwebui.key_name.as_deref());
     // Held for the rest of the handler: if the client disconnects while we wait
     // on the upstream, this closes the record out instead of leaking it.
-    let mut guard = match state
-        .logger
-        .request_started(request_id, RequestInfo::new(peer, &parts, &authentication))
-    {
+    let mut guard = match state.logger.request_started(request_id, info) {
         Ok(guard) => guard,
         Err(AuditAdmissionError::Saturated) => {
             return json_error_body(

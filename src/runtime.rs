@@ -177,6 +177,7 @@ pub struct RuntimeConfig {
     pub telemetry: TelemetryConfig,
     pub readiness: ReadinessConfig,
     pub registration: RegistrationConfig,
+    pub openwebui: OpenWebUiConfig,
 }
 
 impl RuntimeConfig {
@@ -187,6 +188,7 @@ impl RuntimeConfig {
             telemetry: TelemetryConfig::default(),
             readiness: ReadinessConfig::default(),
             registration: RegistrationConfig::default(),
+            openwebui: OpenWebUiConfig::default(),
         }
     }
 }
@@ -197,6 +199,13 @@ impl RuntimeConfig {
 pub struct RegistrationConfig {
     pub enabled: bool,
     pub max_keys: Option<usize>,
+}
+
+/// Names the key an Open WebUI deployment uses, so its forwarded user headers are trusted.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenWebUiConfig {
+    pub key_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +222,8 @@ struct RuntimeFile {
     readiness: ReadinessConfig,
     #[serde(default)]
     registration: RegistrationConfig,
+    #[serde(default)]
+    openwebui: OpenWebUiConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -311,6 +322,7 @@ impl RuntimeConfig {
             telemetry: file.telemetry,
             readiness: file.readiness,
             registration: file.registration,
+            openwebui: file.openwebui,
         })
     }
 }
@@ -593,6 +605,10 @@ impl RuntimeState {
 
     pub fn registration(&self) -> RegistrationConfig {
         self.read().config.registration
+    }
+
+    pub fn openwebui(&self) -> OpenWebUiConfig {
+        self.read().config.openwebui.clone()
     }
 
     pub fn routing(&self) -> RoutingConfig {
